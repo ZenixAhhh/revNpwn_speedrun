@@ -1,0 +1,414 @@
+"""Pure UI widget layer inspired by btop++ draw routines.
+
+These helpers are self-contained: they accept explicit RGB tuples /
+rich styles as parameters and return ``rich.text.Text`` objects (or
+plain markup strings). They must never import theme/console modules so
+they stay usable regardless of which styling backend is active.
+
+Algorithms ported from btop++ (btop_draw.cpp / btop_theme.cpp):
+
+- :func:`gradient`   -- ``Theme::generateGradients`` (two passes of
+  50 + 51 interpolations when a mid color is defined).
+- :func:`meter`      -- ``Meter::operator()``: every filled cell gets
+  its own interpolated color based on its percentage position
+  (per-cell gradient).
+- :func:`braille_graph` -- ``Graph::_create`` braille sparkline: each
+  glyph encodes two consecutive data points via
+  ``index = result0 * 5 + result1`` into the 25-entry ``braille_up``
+  symbol table.
+"""
+
+from __future__ import annotations
+
+import math
+import sys
+from functools import lru_cache
+from typing import Iterable, Optional, Sequence, Tuple
+
+from rich.text import Text
+
+RGB = Tuple[int, int, int]
+
+#: btop++ ``graph_symbols["braille_up"]`` -- 25 glyphs indexed
+#: ``result0 * 5 + result1`` where each result is a 0-4 scaled value.
+BRAILLE_UP: Tuple[str, ...] = tuple(
+    " "
+    "⢀⢠⢰⢸"
+    "⡀⣀⣠⣰⣸"
+    "⡄⣄⣤⣴⣼"
+    "⡆⣆⣦⣶⣾"
+    "⡇⣇⣧⣷⣿"
+)
+
+#: SPEC UI v2 §M1: glyph meter ▰ (U+25B0) / ▱ (U+25B1) — áp dụng cả path
+#: gradient lẫn plain fallback (một nguồn truth, hết nhân bản block tay).
+METER_FILL = "▰"
+METER_EMPTY = "▱"
+
+# Control points for the shared meter families. The concrete 101-position
+# ramps are generated after the interpolation helper so widget colors stay
+# smooth and centralized instead of repeating coarse bands.
+UTILITY_STOPS: tuple[RGB, ...] = (
+    (0x1F, 0x6F, 0x78),  # deep teal
+    (0x5E, 0xEA, 0xD4),  # cyan
+    (0xA7, 0xF3, 0xE8),  # ice
+)
+
+SOLVE_STOPS: tuple[RGB, ...] = (
+    (0xE5, 0x53, 0x4B),  # red
+    (0xFF, 0x8A, 0x3D),  # orange
+    (0xF4, 0xD3, 0x5E),  # yellow
+    (0x9B, 0xE1, 0x5D),  # lime
+    (0x5E, 0xEA, 0xD4),  # cyan / teal
+)
+
+RISK_STOPS: tuple[RGB, ...] = (
+    (0xE5, 0x53, 0x4B),
+    (0xFF, 0x5C, 0x8A),
+)
+
+
+def _clamp(value: float, lo: float, hi: float) -> float:
+    """Clamp vào ``[lo, hi]``; NaN/±inf → ``lo`` an toàn (caller ``int()``-hoá
+    giá trị — không được raise ValueError/OverflowError)."""
+    if not math.isfinite(value):
+        return lo
+    return max(lo, min(hi, value))
+
+
+def _interp_channel(start: int, end: int, step: int, rng: int) -> int:
+    """One channel of btop linear interpolation.
+
+    Mirrors ``output_colors[i][rgb] = input[start] + (i - offset) *
+    (input[end] - input[start]) / current_range`` with C-style integer
+    truncation (inputs may be negative, hence float divide + int()).
+    """
+    return start + int(step * (end - start) / rng)
+
+
+def gradient(
+    start_rgb: RGB,
+    mid_rgb: Optional[RGB],
+    end_rgb: Optional[RGB],
+    steps: int = 101,
+) -> list:
+    """Build an interpolated color ramp of ``steps`` ``(r, g, b)`` tuples.
+
+    Ported from btop ``generateGradients``:
+
+    * with a mid color defined, interpolation runs as two passes
+      (start->mid over the first half, mid->end over the rest);
+    * otherwise a single pass start->end;
+    * with no end color, the whole ramp collapses to ``start_rgb``.
+    """
+    if steps < 1:
+        raise ValueError("steps must be >= 1")
+    if end_rgb is None:
+        return [tuple(start_rgb) for _ in range(steps)]  # type: ignore[arg-type]
+
+    has_mid = mid_rgb is not None
+    current_range = (steps - 1) // 2 if has_mid else (steps - 1)
+
+    out: list = []
+    offset = 0
+    start_idx = 0
+    # End index into the (start, mid, end) source tuple.
+    src = [tuple(start_rgb)]
+    if has_mid:
+        src.append(tuple(mid_rgb))
+    src.append(tuple(end_rgb))
+
+    for i in range(steps):
+        if has_mid and i == current_range:
+            # Switch source arrays from start->mid to mid->end.
+            start_idx += 1
+            offset += current_range
+        out.append(
+            tuple(
+                _interp_channel(src[start_idx][c], src[start_idx + 1][c], i - offset, current_range)
+                for c in range(3)
+            )
+        )
+    return out
+
+
+def multi_stop_gradient(stops: Sequence[RGB], steps: int = 101) -> tuple[RGB, ...]:
+    """Interpolate a smooth ramp through two or more RGB control points.
+
+    Unlike :func:`gradient`, which mirrors btop's start/mid/end API, this
+    helper accepts an arbitrary number of semantic color stops. Output includes
+    both endpoints and distributes interpolation evenly across every segment.
+    """
+    if steps < 1:
+        raise ValueError("steps must be >= 1")
+    if not stops:
+        raise ValueError("at least one color stop is required")
+    normalized = tuple(tuple(int(channel) for channel in rgb) for rgb in stops)
+    if len(normalized) == 1 or steps == 1:
+        return tuple(normalized[0] for _ in range(steps))
+
+    segment_count = len(normalized) - 1
+    out: list[RGB] = []
+    for i in range(steps):
+        position = i * segment_count / (steps - 1)
+        segment = min(int(position), segment_count - 1)
+        fraction = position - segment
+        start = normalized[segment]
+        end = normalized[segment + 1]
+        out.append(tuple(
+            int(round(start[c] + (end[c] - start[c]) * fraction))
+            for c in range(3)
+        ))
+    return tuple(out)
+
+
+# Canonical smooth ramps. AMBER_RAMP remains as a compatibility alias for
+# older imports; new code should use UTILITY_RAMP.
+UTILITY_RAMP: tuple[RGB, ...] = multi_stop_gradient(UTILITY_STOPS, steps=101)
+AMBER_RAMP: tuple[RGB, ...] = UTILITY_RAMP
+SOLVE_RAMP: tuple[RGB, ...] = multi_stop_gradient(SOLVE_STOPS, steps=101)
+RUBY_RAMP: tuple[RGB, ...] = multi_stop_gradient(RISK_STOPS, steps=101)
+
+
+def _rgb_style(rgb: RGB) -> str:
+    return "#{:02x}{:02x}{:02x}".format(*rgb)
+
+
+@lru_cache(maxsize=8192)
+def _meter_cells(value: int, width: int, colors_key: tuple, invert: bool) -> tuple:
+    """Cached raw cells for :func:`meter`.
+
+    ``colors_key`` is the gradient as a tuple of ``(r, g, b)`` tuples;
+    caching keeps the heavy
+    per-cell styling work off repeated redraws (btop caches per value).
+    """
+    colors = list(colors_key)
+    cells = []
+    for i in range(1, width + 1):
+        y = int(round(i * 100.0 / width))
+        if value >= y or (value > 0 and i == 1):
+            # Any non-zero progress gets one visible cell. Without this guard,
+            # e.g. 1/35 (2.9%) on a 22-cell meter looks identical to 0%.
+            color_pos = min(100, max(1, y))
+            rgb = colors[(100 - color_pos) if invert else color_pos]
+            cells.append((METER_FILL, rgb))
+        else:
+            for _ in range(width + 1 - i):
+                cells.append((METER_EMPTY, None))
+            break
+    return tuple(cells)
+
+
+def meter(value: float, width: int, colors: Sequence[RGB], *, invert: bool = False) -> Text:
+    """Gradient bar in the spirit of btop ``Meter::operator()``.
+
+    Every filled cell is colored from ``colors`` (a :func:`gradient`
+    output) according to the percentage position of that cell -- this
+    per-cell gradient is what makes btop meters look smooth. ``value``
+    is clamped to 0-100. Results are LRU-cached per
+    ``(value, width, colors, invert)``.
+    """
+    if width < 1:
+        return Text()
+    v = int(_clamp(value, 0, 100))
+    colors_key = tuple(tuple(c) for c in colors)
+    text = Text()
+    for ch, rgb in _meter_cells(v, width, colors_key, invert):
+        if rgb is None:
+            text.append(ch, style="dim")
+        else:
+            text.append(ch, style=_rgb_style(rgb))
+    return text
+
+
+def plain_meter(value: float, width: int) -> Text:
+    """Bar ``▰``*n + ``▱``*n thuần KHÔNG màu (SPEC UI v2 §M1).
+
+    Fallback ASCII-an-toàn cho non-TTY / terminal hẹp — thay các bản
+    nhân bản ``'█'*n + '░'*n`` tay ở caller. ``value`` clamp 0-100,
+    ``width<1`` → :class:`rich.text.Text` rỗng. Trả ``Text`` (không phải
+    str) để caller không bị rich parse markup nhầm dấu ``[``.
+    """
+    if width < 1:
+        return Text()
+    v = int(_clamp(value, 0, 100))
+    filled = width * v // 100
+    if v > 0 and filled == 0:
+        filled = 1
+    return Text(METER_FILL * filled + METER_EMPTY * max(0, width - filled))
+
+
+def meter_markup(value: float, width: int, colors: Sequence[RGB], *,
+                 invert: bool = False) -> str:
+    """Bản rich-markup string của :func:`meter` (SPEC UI v2 §M1).
+
+    Cho report builder ghép dòng text thuần (vd cột USAGE trong storage
+    report) mà vẫn giữ per-cell gradient — render logic vẫn là ``meter()``
+    duy nhất, hàm này chỉ chuyển spans → tag ``[#rrggbb]``/``[dim]``.
+    """
+    text = meter(value, width, colors, invert=invert)
+    plain = text.plain
+    styles: list = [None] * len(plain)
+    for span in text.spans:
+        for i in range(span.start, min(span.end, len(plain))):
+            styles[i] = span.style
+    out: list = []
+    no_style = object()   # sentinel "chưa mở tag nào"
+    prev = no_style
+    for ch, st in zip(plain, styles):
+        if st != prev:
+            if prev is not no_style:
+                out.append("[/]")
+            out.append(f"[{st}]")
+            prev = st
+        out.append(ch)
+    if prev is not no_style:
+        out.append("[/]")
+    return "".join(out)
+
+
+def log_meter_percentage(value: float, max_value: float) -> float:
+    """Chuyển đổi giá trị sang % theo thang Logarithmic (Log-scale)
+    cho các dải dữ liệu chênh lệch nhiều bậc độ lớn (orders of magnitude).
+    Clamp trong [0.0, 100.0]."""
+    if not math.isfinite(value) or value <= 0:
+        return 0.0
+    if not math.isfinite(max_value) or max_value <= 0:
+        return 0.0
+    if value >= max_value:
+        return 100.0
+    ratio = math.log10(value + 1.0) / math.log10(max_value + 1.0)
+    return min(100.0, max(0.0, ratio * 100.0))
+
+
+def braille_graph(
+    values: Iterable[float],
+    width: int,
+    *,
+    low: Optional[float] = None,
+    high: Optional[float] = None,
+    down: bool = False,
+) -> Text:
+    """Braille sparkline (btop ``Graph::_create``, single-height).
+
+    Each glyph covers two consecutive data points; both are scaled to
+    0-4 over the ``[low, high]`` range and combined as
+    ``BRAILLE_UP[result0 * 5 + result1]``. When ``low``/``high`` are
+    omitted they are derived from the min/max of the data (auto-scale).
+    ``down=True`` flips the vertical axis (graphs fall as values rise),
+    mirroring btop's ``invert`` behaviour.
+
+    Only the last ``width * 2`` values are drawn.
+    """
+    data = [float(v) for v in values]
+    if width < 1:
+        return Text()
+    pts = data[-(width * 2):]
+    # Pad on the left with the first value so short series still align right.
+    while len(pts) < width * 2:
+        pts.insert(0, pts[0] if pts else 0.0)
+
+    if low is None or high is None:
+        data_low = min(pts) if pts else 0.0
+        data_high = max(pts) if pts else 0.0
+    else:
+        data_low, data_high = float(low), float(high)
+
+    def level(v: float) -> int:
+        span = data_high - data_low
+        if span <= 0:
+            # Flat series: zero stays empty, any constant value fills.
+            return 0 if data_high <= 0 else 4
+        lvl = int(round((v - data_low) * 4.0 / span))
+        return int(_clamp(lvl, 0, 4))
+
+    text = Text()
+    for i in range(0, len(pts), 2):
+        r0 = level(pts[i])
+        r1 = level(pts[i + 1])
+        if down:
+            r0, r1 = 4 - r0, 4 - r1
+        text.append(BRAILLE_UP[r0 * 5 + r1])
+    return text
+
+
+def _visible_len(markup: str) -> int:
+    """Length of ``markup`` as rendered, ignoring ``[...]`` style tags."""
+    out = []
+    skip = False
+    for ch in markup:
+        if ch == "[":
+            skip = True
+        elif ch == "]":
+            skip = False
+        elif not skip:
+            out.append(ch)
+    return len("".join(out))
+
+
+def _stdout_isatty() -> bool:
+    """stdout có phải TTY thật không (pattern submit_service — an toàn khi
+    stdout bị thay bằng object thiếu ``isatty``)."""
+    try:
+        return sys.stdout.isatty()
+    except Exception:
+        return False
+
+
+def footer_bar(bindings: Sequence[Tuple[str, str]], width: int,
+               tty: Optional[bool] = None) -> str:
+    """Single-line keybinding bar, btop menu style::
+
+        [↑↓] chọn  ·  [s] sync  ·  [q] thoát
+
+    Shortcut keys are wrapped in ``[hi_fg]`` markup; separators are
+    dim ``·``. Items are dropped from the front (keeping the trailing
+    quit binding) until the visible width fits ``width``. Returns rich
+    markup as a plain string.
+
+    Footer là chrome tương tác: khi stdout KHÔNG phải TTY (pipe/redirect)
+    trả chuỗi rỗng — output piped phải machine-readable, không chrome
+    (uv-style). Caller TUI luôn-tương-tác (watch, menu) truyền
+    ``tty=True`` để giữ hành vi cũ.
+    """
+    if tty is None:
+        tty = _stdout_isatty()
+    if not tty or not bindings or width < 1:
+        return ""
+
+    def render(key: str, label: str) -> str:
+        return f"[hi_fg]{key}[/] {label}"
+
+    sep = "[dim] · [/]"
+    items = [render(k, label) for k, label in bindings]
+
+    def total(parts: list) -> int:
+        return sum(_visible_len(p) for p in parts) + _visible_len(sep) * max(0, len(parts) - 1)
+
+    # Always keep the last item (quit); trim from the front otherwise.
+    keep = [items[-1]] if items else []
+    dropped = items[:-1]
+    while dropped and total(dropped + keep) > width:
+        dropped.pop(0)
+    parts = dropped + keep
+    return sep.join(parts)
+
+
+def shortcut_title(title: str, key: str) -> str:
+    """Section title with the hotkey letter highlighted, e.g.::
+
+        ┌┐[hi_fg]m[/]enu┌┐
+
+    The first occurrence of ``key`` inside ``title`` (case-insensitive)
+    is wrapped in ``[hi_fg]`` markup; if absent, the first character is
+    highlighted instead.
+    """
+    if not title:
+        return ""
+    idx = title.lower().find(key.lower()) if key else -1
+    if idx < 0:
+        idx = 0
+    before = title[:idx]
+    ch = title[idx]
+    after = title[idx + 1:]
+    return f"┌┐{before}[hi_fg]{ch}[/]{after}┌┐"

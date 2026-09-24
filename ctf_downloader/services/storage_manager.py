@@ -1,0 +1,1085 @@
+"""StorageManager — kiểm soát dung lượng workspace CTF + archive lên git.
+
+Trách nhiệm (spec storage-manager):
+
+- **scan_usage**: duyệt mọi workspace con của thư mục gốc (mặc định
+  ``~/Workspace/CTF``), trả danh sách :class:`WorkspaceUsage` với tổng dung
+  lượng, breakdown theo loại (attachments/writeups/solvers/misc), top file
+  lớn nhất, số challenge và thời điểm giải ended (từ mirror
+  ``challenges.json → ctf_info.event_window.end`` của feature Event Window).
+- **format_report**: bảng text PHOSPHOR sắp theo size giảm dần, size
+  human-readable (B/KiB/MiB/GiB); vượt ngưỡng đánh dấu bằng glyph
+  ``!``/``✗`` và workspace ended bằng nhãn ``ended`` muted.
+- **archive_workspace**: đóng gói tar.gz (exclude rác runtime) và tuỳ chọn
+  push lên git remote user cấu hình. KHÔNG tự tạo remote trên dịch vụ nào —
+  chỉ thao tác git subprocess với remote được truyền vào.
+- **delete_workspace**: xoá an toàn vào "thùng rác" = rename sang
+  ``_archives/<name>_DELETED_<ts>`` (KHÔNG rm -rf, không tự gọi nội bộ —
+  chỉ dành cho CLI gọi sau khi user confirm).
+- **suggest_actions**: gợi ý tiếng Việt (archive ws ended >7 ngày, warn vượt
+  ngưỡng, cảnh báo đĩa gần đầy).
+- **export_workspace**: xuất zip bản chia sẻ/kho KHÔNG lộ flag (strip-secrets):
+  redact flag thật trong README/writeup/solver script thành ``[REDACTED]``,
+  bỏ ``flag.txt`` và ``submit_history.json``, xoá field ``submitted_flag``
+  và redact ``status.flag.value`` (schema v2) khỏi metadata.json kèm redact
+  text trên toàn bộ nội dung đã serialize.
+  KHÔNG đụng workspace gốc — chỉ tạo zip.
+
+Method thuần, không dính I/O mạng, dễ test trong tmpdir.
+"""
+import datetime as _dt
+import fnmatch
+import json as _json
+import os
+import re as _re
+import shutil
+import stat
+import subprocess
+import sys
+import tarfile
+import tempfile
+import zipfile
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+from rich.markup import escape
+
+from ..platforms.base import normalize_epoch_to_utc
+from ..storage.constants import FLAG_PLACEHOLDER
+from ..storage.fileio import locked_path
+from ..storage.workspace_repo import WorkspaceRepo
+from ..ui.theme import ERROR as _ERROR_COLOR
+from ..ui.theme import FG_FAINT as _FAINT_COLOR
+from ..ui.theme import FG_MUTED as _MUTED_COLOR
+from ..ui.theme import WARN as _WARN_COLOR
+from ..ui.widgets import RUBY_RAMP, UTILITY_RAMP, meter_markup, plain_meter
+
+# Thư mục con chuẩn của một challenge (workspace layout:
+# <ws>/<Category>/<Chall>/{challenge,script,solver,writeup}/)
+_CHALLENGE_MARKERS = {"challenge", "script", "solver", "writeup"}
+
+# Thư mục bỏ qua khi scan dung lượng (rác sinh ra lúc chạy)
+_SCAN_SKIP_DIRS = {"__pycache__", ".git", ".pytest_cache"}
+
+# Workspace hệ thống không phải dữ liệu CTF của user
+_SYSTEM_WORKSPACES = {"_archives"}
+
+# Exclude mặc định khi archive (state runtime không đáng lưu)
+DEFAULT_EXCLUDE_FILES = ("*.pyc", "*.part", "*.tmp")
+DEFAULT_EXCLUDE_DIRS = ("__pycache__", ".pytest_cache", ".git")
+DEFAULT_EXCLUDE_PATHS = (".ctf/watch_state.json",)
+
+_ARCHIVE_DIR_NAME = "_archives"
+_DELETED_PREFIX = "_DELETED_"
+
+# --- Export strip-secrets (P1-5) -----------------------------------------
+# Placeholder giữ nguyên khi redact (không phải flag thật)
+_EXPORT_PLACEHOLDER_MARKER = "[REDACTED]"
+# Regex generic flag: <prefix chữ/số/gạch dưới>{nội dung không chứa brace}
+_GENERIC_FLAG_RE = _re.compile(
+    r"([A-Za-z][A-Za-z0-9_]{1,31})\{([^{}\n]{2,120})\}"
+)
+# File text redact được: README* hoặc *.md/*.txt, hoặc bất kỳ file nào nằm
+# trong thư mục writeup/ hay solver/ (solve script cũng in/nhét flag thật —
+# hunt-c20 MED), hoặc file tên solve*.py / solver* ở bất kỳ đâu.
+_REDACTABLE_NAME_PATTERNS = ("README*", "*.md", "*.txt", "solver*", "solve*.py")
+# File bị loại KHỎI zip hoàn toàn khi strip_secrets
+_STRIP_ENTIRE_FILES = ("flag.txt", "submit_history.json")
+
+_TIMEZONE = _dt.timezone.utc
+
+
+class StorageError(Exception):
+    """Lỗi thao tác storage (tar/git/...) kèm ngữ cảnh gốc (stderr git...)."""
+
+
+@dataclass
+class WorkspaceUsage:
+    """Dữ liệu dung lượng của một workspace."""
+
+    name: str
+    path: str
+    total_bytes: int
+    breakdown: Dict[str, int]  # attachments / writeups / solvers / misc
+    largest_files: List[Tuple[str, int]]  # top-10 (path tương đối, size)
+    challenge_count: int
+    ended: Optional[_dt.datetime] = None
+
+
+def human_size(num_bytes: float) -> str:
+    """Human-readable theo đơn vị nhị phân: B/KiB/MiB/GiB/TiB."""
+    size = float(num_bytes)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if abs(size) < 1024.0 or unit == "TiB":
+            if unit == "B":
+                return f"{int(size)} B"
+            return f"{size:.1f} {unit}"
+        size /= 1024.0
+    return f"{size:.1f} TiB"
+
+
+def parse_event_end(value: Any) -> Optional[_dt.datetime]:
+    """Parse ``event_window.end`` → aware datetime UTC, hoặc ``None``.
+
+    Delegate sang :func:`platforms.base.normalize_epoch_to_utc` — helper
+    chung của feature Event Window: nhận epoch giây lẫn epoch-ms (bẫy đơn vị
+    GZCTF/rCTF), ISO 8601 string, guard bool/garbage. Giá trị thiếu/không hợp
+    lệ (kể cả bool, ≤ 0, năm < 2000) → ``None`` — không bao giờ raise.
+    """
+    return normalize_epoch_to_utc(value)
+
+
+class StorageManager:
+    """Facade thuần cho các thao tác dung lượng/archive (xem module docstring)."""
+
+    # ------------------------------------------------------------------
+    # 1. scan_usage
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def scan_usage(base_dir: str | os.PathLike) -> List[WorkspaceUsage]:
+        """Duyệt mọi workspace con của ``base_dir``, trả list sắp theo tên.
+
+        - Breakdown phân loại theo thành phần đường dẫn: có segment
+          ``challenge`` → attachments; ``writeup`` → writeups;
+          ``solver`` → solvers; còn lại → misc.
+        - Bỏ qua ``__pycache__/.git/.pytest_cache`` và workspace hệ thống
+          (``_archives``).
+        - ``ended`` đọc từ mirror Event Window; thiếu/không hợp lệ → None.
+        """
+        base = Path(base_dir).expanduser()
+        usages: List[WorkspaceUsage] = []
+        if not base.is_dir():
+            return usages
+
+        for entry in sorted(base.iterdir(), key=lambda p: p.name):
+            if not entry.is_dir() or entry.name in _SYSTEM_WORKSPACES:
+                continue
+            if entry.name.startswith("."):
+                continue
+            usages.append(StorageManager._scan_one(entry))
+        return usages
+
+    @staticmethod
+    def _scan_one(ws_path: Path) -> WorkspaceUsage:
+        total = 0
+        breakdown = {
+            "attachments": 0,
+            "writeups": 0,
+            "solvers": 0,
+            "misc": 0,
+        }
+        files: List[Tuple[str, int]] = []
+        challenge_dirs: set = set()
+
+        for root, dirnames, filenames in os.walk(ws_path):
+            dirnames[:] = sorted(d for d in dirnames if d not in _SCAN_SKIP_DIRS)
+            for fname in sorted(filenames):
+                fpath = Path(root) / fname
+                try:
+                    size = fpath.stat().st_size
+                except OSError:
+                    continue
+                rel = fpath.relative_to(ws_path).as_posix()
+                parts = fpath.relative_to(ws_path).parts
+                total += size
+                files.append((rel, size))
+                breakdown[StorageManager._classify(parts)] += size
+
+        # challenge_count: đếm thư mục depth>=2 (Category/Chall) chứa ít nhất
+        # một marker subdir.
+        for root, dirnames, _filenames in os.walk(ws_path):
+            dirnames[:] = [d for d in dirnames if d not in _SCAN_SKIP_DIRS]
+            rel_parts = Path(root).relative_to(ws_path).parts
+            if len(rel_parts) >= 2 and _CHALLENGE_MARKERS.intersection(dirnames):
+                challenge_dirs.add(str(Path(root).relative_to(ws_path)))
+
+        largest = sorted(files, key=lambda item: (-item[1], item[0]))[:10]
+
+        ended = None
+        try:
+            win = ((WorkspaceRepo(ws_path).read_challenges().get("ctf_info") or {})
+                   .get("event_window") or {})
+            ended = parse_event_end(win.get("end"))
+        except Exception:
+            ended = None
+
+        return WorkspaceUsage(
+            name=ws_path.name,
+            path=str(ws_path),
+            total_bytes=total,
+            breakdown=breakdown,
+            largest_files=largest,
+            challenge_count=len(challenge_dirs),
+            ended=ended,
+        )
+
+    @staticmethod
+    def _classify(rel_parts: Tuple[str, ...]) -> str:
+        """Phân loại file theo segment đầu tiên khớp trong relative parts."""
+        for part in rel_parts:
+            if part == "challenge":
+                return "attachments"
+            if part == "writeup":
+                return "writeups"
+            if part == "solver":
+                return "solvers"
+        return "misc"
+
+    # ------------------------------------------------------------------
+    # 2. format_report
+    # ------------------------------------------------------------------
+
+    #: Viewport thống nhất với AppHeader (spec §4.1): body table không bao
+    #: giờ vượt width này — tên workspace dài bị cắt ellipsis (codex-r2 P1).
+    REPORT_MAX_WIDTH = 80
+
+    #: Độ rộng cột USAGE-meter (SPEC UI v2 §M1): 8 ô ▰▱.
+    USAGE_METER_WIDTH = 8
+
+    @staticmethod
+    def format_report(
+        usages: Sequence[WorkspaceUsage], threshold_mb: int = 1024, *,
+        tty: Optional[bool] = None,
+    ) -> str:
+        """Bảng text PHOSPHOR: workspace sắp theo size giảm dần + dòng tổng.
+
+        - Nhãn cột UPPERCASE faint (ATTACH/WRITEUP/SOLVER/TOTAL) — không
+          emoji chrome; số liệu neutral (không tô màu theo mức dung lượng).
+        - Cột USAGE-meter 8 ô (SPEC UI v2 §M1): bar ``▰▱`` thể hiện
+          ratio = total/ngưỡng (clamp 100%). Dưới ngưỡng dùng ramp amber;
+          ratio ≥1× ngưỡng — state rủi ro — chuyển nguyên bar sang ramp
+          ruby (#E5534B→#FF2E63). non-TTY → ``plain_meter`` không màu.
+        - Vượt ngưỡng ``threshold_mb`` chỉ được đánh dấu bằng glyph semantic
+          ở cột NOTE: ``!`` amber khi ≥ 1× ngưỡng, ``✗`` error khi ≥ 2× —
+          màu warn/error luôn đi kèm glyph. Workspace đã ended: nhãn chữ
+          ``ended`` muted.
+        - Dòng TOTAL dùng nhãn faint, KHÔNG bold đột ngột.
+        - Width bảng ≤ 80 cell — cùng viewport với AppHeader (codex-r2 P1):
+          tên workspace vượt chỗ được cấp bị cắt ``…`` thay vì đẩy bảng ra
+          86–90 cột.
+        - KHÔNG đường ngang full-width ``----`` (ngoài whitelist glyph
+          PHOSPHOR): heading faint + khoảng thở đảm nhiệm phân đoạn.
+
+        ``tty=None`` → tự dò ``sys.stdout.isatty()`` (pattern footer_bar);
+        smoke test truyền tường minh để khoá path render.
+        """
+        if tty is None:
+            try:
+                tty = bool(sys.stdout.isatty())
+            except Exception:
+                tty = False
+        threshold_bytes = int(threshold_mb) * 1024 * 1024
+        rows = sorted(usages, key=lambda u: u.total_bytes, reverse=True)
+
+        def _usage_ratio(u: WorkspaceUsage) -> float:
+            if threshold_bytes <= 0:
+                return 0.0
+            return u.total_bytes / threshold_bytes
+
+        def _usage_cell(u: WorkspaceUsage) -> str:
+            ratio = _usage_ratio(u)
+            pct = min(100.0, ratio * 100.0)
+            if not tty:
+                # non-TTY → plain_meter: ASCII-an-toàn, machine-readable.
+                return plain_meter(pct, StorageManager.USAGE_METER_WIDTH).plain
+            ramp = RUBY_RAMP if ratio >= 1 else UTILITY_RAMP
+            return meter_markup(pct, StorageManager.USAGE_METER_WIDTH, ramp)
+
+        name_natural = max(
+            [len("WORKSPACE")]
+            + [len(u.name) for u in rows]
+        ) if rows else len("WORKSPACE")
+        headers = ["ATTACH", "WRITEUP", "SOLVER", "TOTAL"]
+        # Giá trị THÔ (plain) dùng để tính độ rộng cột.
+        col_raw = [
+            [human_size(u.breakdown.get("attachments", 0)) for u in rows],
+            [human_size(u.breakdown.get("writeups", 0)) for u in rows],
+            [human_size(u.breakdown.get("solvers", 0)) for u in rows],
+            [human_size(u.total_bytes) for u in rows],
+        ]
+        size_w = [
+            max([len(h)] + [len(v) for v in col]) if rows else len(h)
+            for h, col in zip(headers, col_raw)
+        ]
+        usage_w = StorageManager.USAGE_METER_WIDTH
+
+        def _note_markup(usage: WorkspaceUsage) -> str:
+            notes: List[str] = []
+            if threshold_bytes > 0:
+                ratio = usage.total_bytes / threshold_bytes
+                if ratio >= 2:
+                    notes.append(f"[{_ERROR_COLOR}]✗[/{_ERROR_COLOR}]")
+                elif ratio >= 1:
+                    notes.append(f"[{_WARN_COLOR}]![/{_WARN_COLOR}]")
+            now = _dt.datetime.now(_TIMEZONE)
+            if usage.ended is not None and usage.ended <= now:
+                notes.append(f"[{_MUTED_COLOR}]ended[/{_MUTED_COLOR}]")
+            return " ".join(notes)
+
+        note_cells = [_note_markup(u) for u in rows]
+        note_w = max(
+            [len("NOTE")]
+            + [len(_re.sub(r"\[[^\]]*\]", "", n)) for n in note_cells]
+        ) if rows else len("NOTE")
+
+        # Cột name co lại để TỔNG width bảng luôn ≤ REPORT_MAX_WIDTH (cùng
+        # viewport AppHeader); 7 khe 2-space giữa 8 cột + 6 cell CHALLS.
+        gaps_total = 14
+        fixed_w = sum(size_w) + 6 + usage_w + note_w + gaps_total
+        name_w = min(name_natural, max(12, StorageManager.REPORT_MAX_WIDTH
+                                       - fixed_w))
+
+        def _fit_name(name: str) -> str:
+            return (name if len(name) <= name_w
+                    else name[:max(1, name_w - 1)] + "…")
+
+        faint, muted = _FAINT_COLOR, _MUTED_COLOR
+        lines: List[str] = [
+            f"[{faint}]STORAGE[/{faint}]"
+            f"[{muted}] · ngưỡng {threshold_mb} MiB/workspace"
+            f" · ✗ ≥2× · ! ≥1×[/{muted}]",
+            "",
+        ]
+        header = (
+            f"[{faint}]{StorageManager._fit_header('WORKSPACE', name_w):<{name_w}}[/{faint}]  "
+            + "  ".join(
+                f"[{faint}]{h:>{w}}[/{faint}]"
+                for h, w in zip(headers, size_w)
+            )
+            + f"  [{faint}]{'USAGE':<{usage_w}}[/{faint}]"
+            + f"  [{faint}]{'CHALLS':>6}[/{faint}]  "
+            + f"[{faint}]{'NOTE':<{note_w}}[/{faint}]"
+        )
+        lines.append(header)
+        grand = 0
+        for idx, usage in enumerate(rows):
+            grand += usage.total_bytes
+            cells = "  ".join(
+                f"{col_raw[c][idx]:>{size_w[c]}}" for c in range(len(col_raw))
+            )
+            lines.append(
+                f"{escape(_fit_name(usage.name)):<{name_w}}  {cells}"
+                f"  {_usage_cell(usage):<{usage_w}}"
+                f"  {usage.challenge_count:>6}  {note_cells[idx]}"
+            )
+        total_line = (
+            f"[{faint}]{'TOTAL':<{name_w}}[/{faint}]  "
+            + "  ".join(" " * w for w in size_w[:-1])
+            + "  "   # separator sau cột SOLVER (đúng layout dòng số liệu)
+            + f"{human_size(grand):>{size_w[-1]}}"
+        )
+        lines.append(total_line)
+        if not rows:
+            lines.append(f"[{muted}](không có workspace nào)[/{muted}]")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _fit_header(label: str, width: int) -> str:
+        """Nhãn cột name: nếu cột bị co dưới độ dài nhãn thì cắt gọn bằng
+        ``…`` thay vì đẩy lệch lưới (width bảng luôn ≤ REPORT_MAX_WIDTH)."""
+        return label if len(label) <= width else label[:max(1, width - 1)] + "…"
+
+    @staticmethod
+    def _visible_len(markup: str) -> int:
+        """Độ dài hiển thị của chuỗi markup rich (bỏ mọi tag ``[...]``)."""
+        return len(_re.sub(r"\[[^\]]*\]", "", markup))
+
+    @staticmethod
+    def _display_name(usage: WorkspaceUsage) -> str:
+        """Tên hiển thị của workspace (không glyph/emoji — marker ngữ nghĩa
+        nằm ở cột NOTE của :meth:`format_report`)."""
+        return usage.name
+
+    # ------------------------------------------------------------------
+    # 3. archive_workspace
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def archive_workspace(
+        ws_path: str | os.PathLike,
+        out_dir: str | os.PathLike | None = None,
+        *,
+        strip_patterns: Optional[Sequence[str]] = None,
+        git_remote: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Đóng gói workspace thành ``<name>_<YYYYMMDD>.tar.gz``.
+
+        Exclude mặc định: ``__pycache__/``, ``*.pyc``, ``.pytest_cache/``,
+        ``.git/``, ``*.part``, ``*.tmp``, ``.ctf/watch_state.json``; cộng thêm
+        ``strip_patterns`` (fnmatch trên relative posix path, pattern kết thúc
+        ``/`` khớp cả cây thư mục).
+
+        Trả ``{archive_path, original_bytes, archived_bytes, ratio}``.
+
+        ``git_remote``: sau khi tạo archive, đảm bảo ``out_dir`` là git repo
+        (init + commit nếu chưa), rồi commit archive và push tới remote nếu
+        out_dir đã có remote. Lỗi git → raise :class:`StorageError` kèm stderr
+        (không nuốt).
+        """
+        raw_src = Path(ws_path).expanduser().absolute()
+        if raw_src.is_symlink():
+            raise StorageError(
+                f"Từ chối archive workspace qua symlink: {raw_src}"
+            )
+        src = raw_src.resolve()
+        if not src.is_dir():
+            raise StorageError(f"Workspace không tồn tại: {src}")
+        dest = (
+            Path(out_dir).expanduser()
+            if out_dir is not None
+            else src.parent / _ARCHIVE_DIR_NAME
+        )
+        try:
+            dest.mkdir(parents=True, exist_ok=True)
+            dest = dest.resolve()
+        except OSError as exc:
+            # C15-5: ``_archives`` tồn tại dưới dạng FILE (hoặc đường dẫn
+            # không tạo được) phải ra khỏi hàm theo đúng hợp đồng dịch vụ —
+            # StorageError — thay vì FileExistsError/OSError thô.
+            raise StorageError(
+                f"Không thể chuẩn bị thư mục lưu trữ '{dest}': {exc}"
+            ) from exc
+        if dest == src or src in dest.parents:
+            raise StorageError(
+                "Thư mục archive phải nằm NGOÀI workspace nguồn để tránh "
+                "archive tự đóng gói file output/tmp của chính nó."
+            )
+
+        stamp = _dt.datetime.now(_TIMEZONE).strftime("%Y%m%d")
+        archive_path = dest / f"{src.name}_{stamp}.tar.gz"
+        patterns = list(strip_patterns or [])
+
+        original_bytes = 0
+        # C15-6: hai process archive SONG SONG cùng workspace không được
+        # truncate lẫn nhau trên cùng tên cuối ``<name>_<stamp>.tar.gz``.
+        # Giải pháp 2 lớp, cùng giao thức khóa với storage.fileio:
+        #   1. flock trên lockfile ``<archive>.lock`` (locked_path) để các
+        #      process xếp hàng — người sau nhìn thấy workspace SAU khi
+        #      người trước xong, không còn stream ăn nhau im lặng;
+        #   2. ghi vào tmp UNIQUE trong dest rồi os.replace — người xem
+        #      archive bao giờ cũng thấy một bản nguyên vẹn.
+        # Khác protocol fileio: lockfile được dọn CẢ KHI THẤT BẠI (unlink
+        # trong lúc còn giữ khóa) vì _archives phải sạch hoàn toàn khi
+        # archive lỗi (regression f8f94ea: không để lại rác).
+        try:
+            with locked_path(archive_path):
+                tmp_path: Optional[Path] = None
+                try:
+                    fd, tmp_name = tempfile.mkstemp(
+                        dir=str(dest), prefix=archive_path.name + ".",
+                        suffix=".tar.gz.tmp",
+                    )
+                    os.close(fd)
+                    tmp_path = Path(tmp_name)
+                    with tarfile.open(tmp_path, "w:gz") as tf:
+                        for root, dirnames, filenames in os.walk(src):
+                            dirnames[:] = sorted(
+                                d for d in dirnames
+                                if d not in DEFAULT_EXCLUDE_DIRS
+                                and not StorageManager._dir_excluded(
+                                    root, d, src, patterns)
+                            )
+                            for fname in sorted(filenames):
+                                fpath = Path(root) / fname
+                                rel = fpath.relative_to(src).as_posix()
+                                if StorageManager._file_excluded(rel, patterns):
+                                    continue
+                                try:
+                                    size = fpath.stat().st_size
+                                except OSError:
+                                    continue
+                                original_bytes += size
+                                tf.add(fpath, arcname=rel, recursive=False)
+                    os.replace(tmp_path, archive_path)
+                except BaseException:
+                    # ENOSPC/lỗi giữa chừng lẫn Ctrl-C: dọn tmp + lockfile
+                    # TRONG LÚC CÒN GIỮ KHÓA (review-6 LOW) — unlink sau khi
+                    # unlocked sẽ đua với process chờ vừa được grant +
+                    # re-validate trên inode cũ; BaseException phải đi qua
+                    # đây nữa thì Ctrl-C không sót .lock. Re-raise nguyên
+                    # vẹn (StorageError chỉ chuyển cho OSError ở ngoài).
+                    if tmp_path is not None:
+                        try:
+                            tmp_path.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                    try:
+                        archive_path.with_name(
+                            archive_path.name + ".lock").unlink(
+                                missing_ok=True)
+                    except OSError:
+                        pass
+                    raise
+        except OSError as exc:
+            raise StorageError(
+                f"Không thể đóng gói workspace '{src.name}': {exc}"
+            ) from exc
+
+        archived_bytes = archive_path.stat().st_size
+        ratio = (
+            round(archived_bytes / original_bytes, 4) if original_bytes else 0.0
+        )
+        result = {
+            "archive_path": str(archive_path),
+            "original_bytes": original_bytes,
+            "archived_bytes": archived_bytes,
+            "ratio": ratio,
+        }
+
+        if git_remote:
+            StorageManager._git_commit_and_push(dest, git_remote)
+        return result
+
+    @staticmethod
+    def _dir_excluded(root: str, dirname: str, src: Path,
+                      patterns: Sequence[str]) -> bool:
+        # Dựng relative path từ parts để tránh prefix "./" khi root==src
+        # (trước đây "writeup/" không match được thư mục top-level).
+        rel_parts = Path(root).relative_to(src).parts
+        rel_dir = "/".join((*rel_parts, dirname))
+        for pat in patterns:
+            p = pat.rstrip("/") + "/"
+            if fnmatch.fnmatch(rel_dir + "/", p) or fnmatch.fnmatch(
+                rel_dir, pat.rstrip("/")
+            ):
+                return True
+        return False
+
+    @staticmethod
+    def _file_excluded(rel: str, patterns: Sequence[str]) -> bool:
+        if rel in DEFAULT_EXCLUDE_PATHS:
+            return True
+        if fnmatch.fnmatch(rel, "*.pyc") or fnmatch.fnmatch(
+            rel, "*.part"
+        ) or fnmatch.fnmatch(rel, "*.tmp"):
+            return True
+        for pat in patterns:
+            base = pat.rstrip("/")
+            # fnmatch '*' ăn cả '/', nên khớp cả prefix-less lẫn ở giữa cây.
+            if fnmatch.fnmatch(rel, base) or fnmatch.fnmatch(
+                rel, "*/" + base
+            ):
+                return True
+        return False
+
+    @staticmethod
+    def _run_git_raw(
+        args: Sequence[str], cwd: Path
+    ) -> subprocess.CompletedProcess:
+        git_exe = shutil.which("git")
+        if not git_exe:
+            raise StorageError(
+                "Không tìm thấy git trong PATH — không thể archive/push bằng Git. "
+                "Hãy cài Git hoặc chạy archive không dùng git_remote."
+            )
+        try:
+            return subprocess.run(
+                [git_exe] + list(args),
+                cwd=str(cwd),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except OSError as exc:
+            raise StorageError(f"Không chạy được git ({git_exe}): {exc}") from exc
+
+    @staticmethod
+    def _run_git(
+        args: Sequence[str], cwd: Path
+    ) -> subprocess.CompletedProcess:
+        """Run Git and preserve the long-standing two-argument helper contract."""
+        proc = StorageManager._run_git_raw(args, cwd)
+        if proc.returncode != 0:
+            raise StorageError(
+                f"git {' '.join(args)} thất bại (exit {proc.returncode}): "
+                f"{(proc.stderr or proc.stdout).strip()}"
+            )
+        return proc
+
+    @staticmethod
+    def _has_remote(repo_dir: Path) -> bool:
+        try:
+            proc = StorageManager._run_git_raw(["remote"], repo_dir)
+            return proc.returncode == 0 and bool(proc.stdout.strip())
+        except StorageError:
+            return False
+
+    @staticmethod
+    def _git_commit_and_push(out_dir: Path, git_remote: str) -> None:
+        """Commit archive trong out_dir; push nếu repo đã có remote.
+
+        KHÔNG tự tạo remote — chỉ push tới ``git_remote`` do user cấu hình
+        (được dùng làm remote 'origin' khi repo chưa có remote nào).
+        """
+        if not (out_dir / ".git").exists():
+            StorageManager._run_git(["init"], out_dir)
+        remotes_proc = StorageManager._run_git_raw(["remote"], out_dir)
+        has_origin = remotes_proc.returncode == 0 and bool(
+            remotes_proc.stdout.strip()
+        )
+        if git_remote and not has_origin:
+            StorageManager._run_git(["remote", "add", "origin", git_remote],
+                                    out_dir)
+
+        StorageManager._run_git(["add", "."], out_dir)
+        # Commit: cho phép "nothing to commit" (archive giống hệt lần trước)
+        commit = StorageManager._run_git_raw(
+            [
+                "commit",
+                "-m",
+                f"archive: backup {_dt.datetime.now(_TIMEZONE):%Y-%m-%d}",
+            ],
+            out_dir,
+        )
+        combined = (commit.stdout + commit.stderr).lower()
+        if commit.returncode != 0 and "nothing to commit" not in combined:
+            raise StorageError(
+                f"git commit thất bại (exit {commit.returncode}): "
+                f"{commit.stderr.strip()}"
+            )
+
+        if StorageManager._has_remote(out_dir):
+            branch_proc = StorageManager._run_git(
+                ["rev-parse", "--abbrev-ref", "HEAD"], out_dir
+            )
+            branch = branch_proc.stdout.strip() or "master"
+            StorageManager._run_git(["push", "-u", "origin", branch], out_dir)
+
+    # ------------------------------------------------------------------
+    # 4. delete_workspace
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def delete_workspace(
+        ws_path: str | os.PathLike,
+        trash_dir: str | os.PathLike | None = None,
+    ) -> str:
+        """"Xoá" an toàn: rename workspace sang thùng rác
+        ``<trash_dir>/<name>_DELETED_<YYYYmmdd_HHMMSS>``.
+
+        KHÔNG rm -rf — dữ liệu luôn phục hồi được bằng mv ngược. Method này
+        KHÔNG được gọi nội bộ; chỉ CLI dùng sau khi user confirm.
+
+        Trả về đường dẫn mới (thùng rác).
+        """
+        raw_src = Path(ws_path).expanduser().absolute()
+        if raw_src.is_symlink():
+            raise StorageError(
+                f"Từ chối delete workspace qua symlink: {raw_src}"
+            )
+        src = raw_src.resolve()
+        if not src.is_dir():
+            raise StorageError(f"Workspace không tồn tại: {src}")
+        dest_root = (
+            Path(trash_dir).expanduser()
+            if trash_dir is not None
+            else src.parent / _ARCHIVE_DIR_NAME
+        )
+        try:
+            dest_root.mkdir(parents=True, exist_ok=True)
+            dest_root = dest_root.resolve()
+        except OSError as exc:
+            raise StorageError(
+                f"Không thể chuẩn bị thùng rác '{dest_root}': {exc}"
+            ) from exc
+        if dest_root == src or src in dest_root.parents:
+            raise StorageError(
+                "Thùng rác phải nằm NGOÀI workspace nguồn; không thể rename "
+                "một thư mục vào chính cây con của nó."
+            )
+        ts = _dt.datetime.now(_TIMEZONE).strftime("%Y%m%d_%H%M%S")
+        target = dest_root / f"{src.name}{_DELETED_PREFIX}{ts}"
+        try:
+            src.rename(target)
+        except OSError as exc:
+            raise StorageError(f"Không rename được '{src}' → '{target}': {exc}") from exc
+        return str(target)
+
+    # ------------------------------------------------------------------
+    # 5. suggest_actions
+    # ------------------------------------------------------------------
+
+    ARCHIVE_AFTER_DAYS = 7
+
+    @classmethod
+    def suggest_actions(
+        cls,
+        base_dir: str | os.PathLike,
+        threshold_mb: int = 1024,
+    ) -> List[str]:
+        """Gợi ý tiếng Việt: archive ws ended quá hạn, warn vượt ngưỡng,
+        cảnh báo đĩa gần đầy / workspace chiếm gần hết chỗ trống."""
+        actions: List[str] = []
+        usages = cls.scan_usage(base_dir)
+        now = _dt.datetime.now(_TIMEZONE)
+        threshold_bytes = int(threshold_mb) * 1024 * 1024
+        total_bytes = 0
+
+        for usage in usages:
+            total_bytes += usage.total_bytes
+            if usage.ended is not None and usage.ended <= now:
+                days = (now - usage.ended).days
+                if days > cls.ARCHIVE_AFTER_DAYS:
+                    end_s = usage.ended.strftime("%Y-%m-%d")
+                    actions.append(
+                        f"ℹ Workspace '{usage.name}' đã kết thúc từ {end_s} "
+                        f"({days} ngày trước) — nên archive để giải phóng "
+                        f"{human_size(usage.total_bytes)}."
+                    )
+            if usage.total_bytes > threshold_bytes:
+                actions.append(
+                    f"! Workspace '{usage.name}' vượt ngưỡng "
+                    f"{threshold_mb} MiB (hiện {human_size(usage.total_bytes)}) "
+                    f"— cân nhắc archive hoặc dọn solver/misc."
+                )
+
+        try:
+            disk = shutil.disk_usage(base_dir)
+        except OSError:
+            disk = None
+        if disk is not None:
+            used_pct = disk.used / disk.total * 100 if disk.total else 0
+            if used_pct >= 90:
+                actions.append(
+                    f"! Đĩa đã dùng {used_pct:.0f}% "
+                    f"(còn trống {human_size(disk.free)}) — nên archive bớt."
+                )
+            elif total_bytes > disk.free and total_bytes > 0:
+                actions.append(
+                    f"! Tổng workspace ({human_size(total_bytes)}) lớn hơn chỗ "
+                    f"trống trên đĩa ({human_size(disk.free)}) — archive sớm."
+                )
+
+        if not actions:
+            actions.append("✔ Mọi thứ ổn — không có hành động nào cần thiết.")
+        return actions
+
+    # ------------------------------------------------------------------
+    # 6. export_workspace (P1-5: zip strip-flags)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def export_workspace(
+        ws_path: str | os.PathLike,
+        out_path: str | os.PathLike | None = None,
+        *,
+        strip_secrets: bool = True,
+    ) -> Dict[str, Any]:
+        """Xuất workspace thành zip bản chia sẻ/kho, tuỳ chọn strip secrets.
+
+        Tạo ``<name>_export_<YYYYMMDD>.zip`` (mặc định cạnh ``_archives``,
+        hoặc đúng đường dẫn ``out_path`` — nếu ``out_path`` là thư mục hiện
+        có thì đặt file mặc định bên trong).
+
+        Exclude giống archive_workspace: ``__pycache__/``, ``*.pyc``,
+        ``.pytest_cache/``, ``.git/``, ``*.part``, ``*.tmp``,
+        ``.ctf/watch_state.json``.
+
+        ``strip_secrets=True``:
+        - README/writeup/solver text: flag thật → ``[REDACTED]`` (regex generic
+          + ``challenges.json → ctf_info.flag_format`` nếu đọc được; placeholder
+          ``FLAG{...}`` giữ nguyên);
+        - mọi ``flag.txt``: loại khỏi zip;
+        - ``submit_history.json``: loại nguyên file;
+        - ``metadata.json``: xoá key ``submitted_flag``, redact
+          ``status.flag.value`` (schema v2) → ``[REDACTED]`` (giữ cấu trúc
+          khác), rồi vẫn redact flag dạng text trên toàn bộ JSON.
+
+        KHÔNG đụng workspace gốc — chỉ đọc. Trả
+        ``{zip_path, files_count, stripped_count}`` với ``stripped_count``
+        là tổng số chỗ đã redact/loại bỏ.
+        """
+        raw_src = Path(ws_path).expanduser().absolute()
+        if raw_src.is_symlink():
+            raise StorageError(
+                f"Từ chối export workspace qua symlink: {raw_src}"
+            )
+        src = raw_src.resolve()
+        if not src.is_dir():
+            raise StorageError(f"Workspace không tồn tại: {src}")
+
+        stamp = _dt.datetime.now(_TIMEZONE).strftime("%Y%m%d")
+        default_name = f"{src.name}_export_{stamp}.zip"
+        if out_path is None:
+            dest_dir = src.parent / _ARCHIVE_DIR_NAME
+            zip_path = dest_dir / default_name
+        else:
+            out = Path(out_path).expanduser()
+            if out.is_dir():
+                zip_path = out / default_name
+            else:
+                zip_path = out
+        try:
+            zip_path.parent.mkdir(parents=True, exist_ok=True)
+            zip_path = zip_path.parent.resolve() / zip_path.name
+        except OSError as exc:
+            raise StorageError(
+                f"Không thể chuẩn bị nơi export '{zip_path.parent}': {exc}"
+            ) from exc
+        if zip_path.parent == src or src in zip_path.parent.parents:
+            raise StorageError(
+                "File export phải nằm NGOÀI workspace nguồn để tránh ZIP tự "
+                "đóng gói chính file output đang được ghi."
+            )
+
+        flag_format_re = (
+            StorageManager._load_flag_format_regex(src)
+            if strip_secrets else None
+        )
+
+        files_count = 0
+        stripped_count = 0
+        try:
+            with locked_path(zip_path):
+                tmp_path: Optional[Path] = None
+                try:
+                    fd, tmp_name = tempfile.mkstemp(
+                        dir=str(zip_path.parent),
+                        prefix=zip_path.name + ".",
+                        suffix=".zip.tmp",
+                    )
+                    os.close(fd)
+                    tmp_path = Path(tmp_name)
+                    with zipfile.ZipFile(
+                        tmp_path, "w", zipfile.ZIP_DEFLATED
+                    ) as zf:
+                        for root, dirnames, filenames in os.walk(src):
+                            dirnames[:] = sorted(
+                                d for d in dirnames
+                                if d not in DEFAULT_EXCLUDE_DIRS
+                                and not StorageManager._dir_excluded(
+                                    root, d, src, []
+                                )
+                            )
+                            for fname in sorted(filenames):
+                                fpath = Path(root) / fname
+                                rel = fpath.relative_to(src).as_posix()
+                                if StorageManager._file_excluded(rel, []):
+                                    continue
+
+                                # Never dereference a workspace symlink into
+                                # an exported ZIP. Read one already-verified
+                                # regular file descriptor and transform those
+                                # bytes only; this also closes the lstat/read
+                                # TOCTOU window on the final path component.
+                                raw_bytes = StorageManager._read_export_file(
+                                    src, fpath
+                                )
+                                if raw_bytes is None:
+                                    continue
+
+                                if strip_secrets:
+                                    if fname in _STRIP_ENTIRE_FILES:
+                                        stripped_count += 1
+                                        continue
+                                    payload, redacted = (
+                                        StorageManager._transform_for_export(
+                                            fpath, fname, rel, flag_format_re,
+                                            raw_bytes=raw_bytes,
+                                        )
+                                    )
+                                    stripped_count += redacted
+                                else:
+                                    payload = raw_bytes
+
+                                zf.writestr(rel, payload)
+                                files_count += 1
+                    os.replace(tmp_path, zip_path)
+                except BaseException:
+                    if tmp_path is not None:
+                        try:
+                            tmp_path.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                    try:
+                        zip_path.with_name(
+                            zip_path.name + ".lock"
+                        ).unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                    raise
+        except OSError as exc:
+            raise StorageError(
+                f"Không thể export workspace '{src.name}': {exc}"
+            ) from exc
+
+        return {
+            "zip_path": str(zip_path),
+            "files_count": files_count,
+            "stripped_count": stripped_count,
+        }
+
+    # -- helpers cho export_workspace -------------------------------------
+
+    @staticmethod
+    def _read_export_file(src: Path, fpath: Path) -> Optional[bytes]:
+        """Read one regular file without following symlinks outside ``src``.
+
+        Returns ``None`` for symlinks, special files, containment failures,
+        disappearing files, or races where the inode changed between lstat
+        and open. ``O_NOFOLLOW`` is used when the platform provides it.
+        """
+        try:
+            before = os.lstat(fpath)
+            if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+                return None
+            resolved = fpath.resolve(strict=True)
+            try:
+                resolved.relative_to(src)
+            except ValueError:
+                return None
+
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(fpath, flags)
+            try:
+                after = os.fstat(fd)
+                if not stat.S_ISREG(after.st_mode):
+                    return None
+                if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+                    return None
+                with os.fdopen(fd, "rb", closefd=True) as fh:
+                    fd = -1
+                    return fh.read()
+            finally:
+                if fd >= 0:
+                    os.close(fd)
+        except (OSError, ValueError):
+            return None
+
+    @staticmethod
+    def _load_flag_format_regex(ws_path: Path) -> Optional[_re.Pattern]:
+        """Đọc ``ctf_info.flag_format`` từ challenges.json → compiled regex.
+
+        Thiếu/không đọc được/hỏng regex → ``None`` (fallback còn generic).
+        Bỏ anchor ``^``/``$`` vì flag trong writeup thường nằm giữa dòng.
+        """
+        try:
+            data = WorkspaceRepo(ws_path).read_challenges()
+            fmt = ((data.get("ctf_info") or {}).get("flag_format")) or None
+            if not fmt or not isinstance(fmt, str):
+                return None
+            body = fmt.strip()
+            if body.startswith("^"):
+                body = body[1:]
+            if body.endswith("$"):
+                body = body[:-1]
+            return _re.compile(body)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _is_redactable_text(fname: str, rel: str) -> bool:
+        """True nếu là file text đáng redact: README*/*.md/*.txt,
+        ``solve*.py``/``solver*``, hoặc nằm trong thư mục ``writeup/`` hay
+        ``solver/``."""
+        parts = Path(rel).parts
+        if any(part in ("writeup", "solver") for part in parts[:-1]):
+            return True
+        return any(fnmatch.fnmatch(fname, pat) for pat in _REDACTABLE_NAME_PATTERNS)
+
+    @staticmethod
+    def _redact_text(text: str, flag_format_re: Optional[_re.Pattern]) -> Tuple[str, int]:
+        """Thay flag thật bằng ``[REDACTED]``, giữ placeholder ``FLAG{...}``.
+
+        Trả ``(text_mới, số_lần_redact)``.
+        """
+        count = 0
+
+        def _generic_sub(match: "_re.Match") -> str:
+            nonlocal count
+            inner = match.group(2)
+            if inner == "...":  # placeholder FLAG{...} — giữ nguyên
+                return match.group(0)
+            count += 1
+            return _EXPORT_PLACEHOLDER_MARKER
+
+        result = _GENERIC_FLAG_RE.sub(_generic_sub, text)
+
+        if flag_format_re is not None:
+            def _format_sub(match: "_re.Match") -> str:
+                nonlocal count
+                # Đoạn khớp có thể đã bị generic redact trước đó — không đếm kép.
+                if match.group(0) == _EXPORT_PLACEHOLDER_MARKER:
+                    return match.group(0)
+                count += 1
+                return _EXPORT_PLACEHOLDER_MARKER
+
+            result = flag_format_re.sub(_format_sub, result)
+
+        return result, count
+
+    @staticmethod
+    def _redact_metadata_dict(data: dict) -> Tuple[dict, int]:
+        """Redact ĐỦ các vị trí flag có cấu trúc trong metadata.json
+        (hunt-c20 HIGH): key legacy ``submitted_flag`` + schema v2
+        ``status.flag.value`` (hoard_flag/submit/migrate-on-read ghi flag
+        thật ở đó). Giữ nguyên phần còn lại của cấu trúc.
+
+        Trả ``(dict_đã_redact, số_vị_trí_cấu_trúc_redact)``.
+        """
+        n_struct = 0
+        if "submitted_flag" in data:
+            del data["submitted_flag"]
+            n_struct += 1
+        status = data.get("status")
+        if isinstance(status, dict):
+            flag_block = status.get("flag")
+            if isinstance(flag_block, dict):
+                val = flag_block.get("value")
+                # Placeholder FLAG{...} không phải flag thật — giữ nguyên
+                # (khớp semantics migrate-on-read của workspace_repo).
+                if isinstance(val, str) and val.strip() \
+                        and val != FLAG_PLACEHOLDER:
+                    flag_block["value"] = _EXPORT_PLACEHOLDER_MARKER
+                    n_struct += 1
+        return data, n_struct
+
+    @staticmethod
+    def _transform_for_export(
+        fpath: Path,
+        fname: str,
+        rel: str,
+        flag_format_re: Optional[_re.Pattern],
+        *,
+        raw_bytes: Optional[bytes] = None,
+    ) -> Tuple[bytes, int]:
+        """Chuẩn bị nội dung một file cho zip strip-secrets.
+
+        Trả ``(bytes_ghi_vào_zip, số_redact)``. metadata.json redact cả vị
+        trí CÓ CẤU TRÚC (``submitted_flag``, ``status.flag.value``) lẫn text
+        (flag lẫn trong notes/raw...) tính mỗi chỗ 1 redact;
+        file nhị phân/giữ nguyên → 0.
+        """
+        if raw_bytes is None:
+            # Compatibility for direct unit/plugin callers. The main export
+            # path always supplies bytes from _read_export_file().
+            raw_bytes = fpath.read_bytes()
+
+        if fname == "metadata.json":
+            try:
+                raw = raw_bytes.decode("utf-8-sig")
+                data = _json.loads(raw)
+            except (UnicodeDecodeError, ValueError):
+                return raw_bytes, 0
+            if not isinstance(data, dict):
+                return raw.encode("utf-8"), 0
+            data, n_struct = StorageManager._redact_metadata_dict(data)
+            # Vẫn chạy _redact_text trên toàn bộ text đã serialize như nhánh
+            # writeup: flag có thể lọt ở notes/raw/title... (hunt-c20 HIGH).
+            text = _json.dumps(data, ensure_ascii=False, indent=2) + "\n"
+            new_text, n_text = StorageManager._redact_text(text, flag_format_re)
+            if n_struct == 0 and n_text == 0:
+                return raw.encode("utf-8"), 0  # sạch → passthrough nguyên byte
+            return new_text.encode("utf-8"), n_struct + n_text
+
+        if StorageManager._is_redactable_text(fname, rel):
+            try:
+                raw = raw_bytes.decode("utf-8")
+            except UnicodeDecodeError:
+                return raw_bytes, 0
+            new_text, n = StorageManager._redact_text(raw, flag_format_re)
+            return new_text.encode("utf-8"), n
+
+        return raw_bytes, 0

@@ -1,0 +1,1567 @@
+"""PullService — pipeline tải workspace từ một nền tảng CTF.
+
+Chứa thân logic cũ của ``core.CTFDownloader.run`` với một sửa lỗi:
+thay vì chia sẻ DUY NHẤT một ``requests.Session`` cho mọi worker thread
+(bug §8.8 spec — requests.Session không thread-safe), các worker nhận
+session riêng qua ``session_factory.thread_local_sessions``: session master
+được dùng trên main thread cho detect + authenticate, sau đó mỗi worker
+copy cookies/headers từ master đúng 1 lần và tái sử dụng trong suốt thread.
+"""
+import os
+import time
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+from rich.markup import escape
+from rich.progress import (Progress, ProgressColumn, BarColumn, TextColumn,
+                           TimeElapsedColumn, MofNCompleteColumn)
+from rich.text import Text
+
+from ..config import DownloaderConfig
+from ..utils.failure_diagnostics import diagnose_os_error
+from ..utils.http_client import diagnose_request_exception
+from ..utils.logger import Logger
+from ..ui import SPINNER, err_console, ok_summary
+# err_console (ui/console.py) KHÔNG gắn theme → tag token như [solved] không
+# resolve được ở đây; dòng diff +/- render qua err_console phải dùng HẰNG HEX
+# từ ui.theme (pattern _SOLVED_COLOR của cli_commands).
+from ..ui.theme import ERROR as _ERROR_COLOR, SOLVED as _SOLVED_COLOR
+from ..ui.diagnostics import Diagnostic, render as render_diagnostic
+from ..platforms.detector import PlatformDetector
+from ..platforms.base import Challenge
+from ..storage.constants import SOLVE_RANK
+from ..extractors.link_extractor import LinkExtractor
+from ..downloaders.manager import DownloadManager, ConsentState
+from ..generator.workspace_builder import WorkspaceBuilder
+from ..generator.summary_generator import SummaryGenerator
+from .session_factory import create_session, thread_local_sessions
+
+
+class _BrailleSpinnerColumn(ProgressColumn):
+    """Spinner braille dùng đúng bộ frame từ ``ui.style.SPINNER``."""
+
+    def __init__(self, speed: float = 1.0) -> None:
+        super().__init__()
+        self.speed = speed
+
+    def render(self, task):
+        elapsed = task.get_time() * self.speed
+        frame = round(elapsed * 10) % len(SPINNER)
+        return Text(SPINNER[frame], style="progress.spinner")
+
+
+# Hint dùng chung cho mọi vấn đề xác thực / truy cập danh sách đề.
+_DOCTOR_HINTS = (
+    "chạy 'ctf doctor -u <url>' để kiểm tra cookie/token",
+)
+
+
+class PullService:
+    # ------------------------------------------------------------------ #
+    # UI helpers — output discipline theo layer ctf_downloader.ui
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _fetch_challenges_ui(platform: Any) -> List[Any]:
+        """Bọc ``fetch_challenges`` trong spinner braille transient trên
+        err_console: khi xong spinner biến mất, chỉ còn một dòng
+        ``ok_summary`` ("Đã tải N challenges trong X.XXs")."""
+        start = time.time()
+        with Progress(
+            _BrailleSpinnerColumn(),
+            TextColumn("[dim]{task.description}[/dim]"),
+            console=err_console,
+            transient=True,
+        ) as progress:
+            progress.add_task("Đang tải danh sách đề...", total=None)
+            challenges = platform.fetch_challenges()
+        secs = time.time() - start
+        err_console.print(ok_summary("tải", len(challenges), "challenge", secs))
+        return challenges
+
+    @staticmethod
+    def _render_detect_failure(config: DownloaderConfig, start_time: float,
+                               exc: Exception) -> Dict[str, Any]:
+        """Render Diagnostic cho lỗi phát hiện nền tảng + trả dict thất bại."""
+        net = diagnose_request_exception(exc, method="GET")
+        if net.code != "unknown-error":
+            cause = f"{net.code} · {net.summary}"
+            hints = (net.hint, *_DOCTOR_HINTS)
+        else:
+            cause = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+            hints = ("kiểm tra URL giải (đúng domain, có https://)",
+                     *_DOCTOR_HINTS)
+        render_diagnostic(Diagnostic(
+            "error",
+            "Không phát hiện được nền tảng CTF",
+            cause=cause,
+            hints=hints,
+        ))
+        return {"ok": False, "output_dir": config.output_dir,
+                "summary_file": None, "total_files": 0,
+                "challenges_processed": 0,
+                "elapsed_seconds": time.time() - start_time,
+                "bqa_error_code": (
+                    "CTF-PULL-D14" if net.code != "unknown-error" else "CTF-PULL-D02"
+                )}
+
+    @staticmethod
+    def _platform_recon_evidence(platform: Any) -> Dict[str, Any]:
+        """Return only the detector's structural evidence for a BQA incident."""
+        evidence = getattr(platform, "bqa_recon_evidence", None)
+        return dict(evidence) if isinstance(evidence, dict) else {}
+
+    @staticmethod
+    def _render_auth_warning() -> None:
+        """Render Diagnostic cảnh báo xác thực thất bại (pipeline vẫn chạy)."""
+        render_diagnostic(Diagnostic(
+            "warning",
+            "Xác thực thất bại — tiếp tục với tư cách khách chưa đăng nhập",
+            hints=_DOCTOR_HINTS,
+        ))
+
+    @staticmethod
+    def _render_no_challenges() -> None:
+        """Render Diagnostic cho danh sách đề rỗng / không truy cập được."""
+        render_diagnostic(Diagnostic(
+            "error",
+            "Không tìm thấy challenge nào hoặc không truy cập được danh sách đề",
+            hints=("kiểm tra cookie/token còn hạn và URL đúng giải",
+                   *_DOCTOR_HINTS),
+        ))
+
+    @staticmethod
+    def _render_workspace_write_failure(exc: Exception) -> None:
+        """Render Diagnostic khi không tạo/ghi được thư mục workspace."""
+        local = diagnose_os_error(exc)
+        hints: tuple[str, ...]
+        if local.code != "unknown-local-error":
+            cause = f"{local.code} · {local.summary}"
+            hints = (local.hint,)
+        else:
+            cause = f"{type(exc).__name__}: {exc}"
+            hints = (
+                "kiểm tra quyền ghi và dung lượng đĩa trống của thư mục đích",
+                "chọn thư mục output khác nếu đường dẫn hiện tại bị khoá",
+            )
+        render_diagnostic(Diagnostic(
+            "error",
+            "Không ghi được workspace",
+            cause=cause,
+            hints=hints,
+        ))
+
+    @staticmethod
+    def _download_failure_code(results: List[Dict[str, Any]]) -> str:
+        """Classify failed file results without retaining URLs or messages."""
+        failed = [item for item in results if not item.get("success")]
+        messages = " ".join(str(item.get("message", "")).lower() for item in failed)
+        if any(marker in messages for marker in (
+            "integrity", "mismatch", "checksum", "etag", "range", "resume", "thiếu (",
+        )):
+            return "CTF-PULL-D08"
+        if any(str(item.get("source", "")).startswith("description_") for item in failed):
+            return "CTF-PULL-D07"
+        return "CTF-PULL-D06"
+
+    @staticmethod
+    def _render_total_download_failure(failed: int, total: int) -> None:
+        """Render Diagnostic khi TOÀN BỘ challenge trong lượt pull thất bại
+        (lỗi per-challenge vẫn log riêng như cũ — đây là tổng kết nghiêm trọng)."""
+        render_diagnostic(Diagnostic(
+            "error",
+            f"Tải thất bại trên toàn bộ {failed}/{total} challenge",
+            hints=("kiểm tra kết nối mạng và cookie đăng nhập",
+                   *_DOCTOR_HINTS,
+                   "thử chạy lại với '-j 1' nếu platform rate-limit"),
+        ))
+
+    @staticmethod
+    def _prepare_git_workflow(config: DownloaderConfig, platform: Any) -> Optional[Dict[str, Any]]:
+        """Create/checkout the contest branch before any workspace write."""
+        if not getattr(config, "git_workflow", False):
+            return None
+        from .git_workflow import GitWorkflowService
+
+        output_dir = config.output_dir
+        if not output_dir:
+            raise ValueError(
+                "Git workflow cần output_dir đã resolve trước khi prepare branch."
+            )
+        title = getattr(getattr(platform, "ctf_info", None), "title", None)
+        title = title or os.path.basename(output_dir) or "CTF"
+        meta = GitWorkflowService.prepare_pull(
+            output_dir,
+            title,
+            base_branch=getattr(config, "git_base_branch", "main") or "main",
+            remote=getattr(config, "git_remote", "origin") or "origin",
+        )
+        Logger.info(
+            f"Git event branch: [literal]{escape(meta['branch'])}[/literal] "
+            f"→ base [literal]{escape(meta['base_branch'])}[/literal]",
+            markup=True,
+        )
+        return meta
+
+    @staticmethod
+    def _finalize_git_workflow(config: DownloaderConfig) -> Optional[Dict[str, Any]]:
+        """Checkpoint workspace and optionally push the event branch."""
+        if not getattr(config, "git_workflow", False):
+            return None
+        from .git_workflow import GitWorkflowService
+
+        output_dir = config.output_dir
+        if not output_dir:
+            raise ValueError(
+                "Git workflow cần output_dir đã resolve trước khi checkpoint."
+            )
+        result = GitWorkflowService.checkpoint_and_push(
+            output_dir,
+            message=f"ctf({os.path.basename(output_dir)}): pull snapshot",
+            push=bool(getattr(config, "git_auto_push", True)),
+        )
+        if result.get("pushed"):
+            Logger.success(
+                f"Đã push Git branch {result['branch']} → {result['remote']}."
+            )
+        elif getattr(config, "git_auto_push", True):
+            Logger.warning(
+                "Git branch đã commit local nhưng chưa push vì repo chưa có remote."
+            )
+        else:
+            Logger.info(f"Git branch {result['branch']} đã checkpoint local.")
+        return result
+
+    @staticmethod
+    def run(config: DownloaderConfig,
+            session: Optional[Any] = None) -> Dict[str, Any]:
+        """Tải toàn bộ challenge của giải về workspace.
+
+        Args:
+            config: cấu hình downloader (đã/một phần điền).
+            session: session master tùy chọn; nếu bỏ trống sẽ tự tạo.
+                Chỉ được dùng trên main thread (detect/authenticate) —
+                các worker thread luôn nhận bản sao riêng.
+
+        Returns:
+            dict kết quả: ``ok``, ``output_dir``, ``summary_file``,
+            ``total_files``, ``challenges_processed``, ``elapsed_seconds``.
+        """
+        config.validate()
+        start_time = time.time()
+        # URL already belongs to the CLI/menu context; don't repeat it in
+        # the service body. Service output starts with actionable state.
+
+        # Session master: chỉ main thread dùng (detect platform + authenticate)
+        master = session or create_session(
+            cookie=config.cookie,
+            token=config.token,
+            custom_headers=config.custom_headers,
+            timeout=config.timeout,
+            base_url=config.url,
+            insecure=getattr(config, 'insecure', False),
+        )
+
+        # 1. Detect Platform
+        try:
+            platform = PlatformDetector.detect_platform(config.url, master)
+        except Exception as exc:
+            return PullService._render_detect_failure(config, start_time, exc)
+
+        # 2. Authenticate
+        auth_success = platform.authenticate()
+        if not auth_success:
+            PullService._render_auth_warning()
+
+        # 3. Fetch Challenges (spinner transient + ok_summary)
+        try:
+            challenges = PullService._fetch_challenges_ui(platform)
+        except Exception as exc:
+            Logger.error(f"Không đọc được danh sách challenge: {type(exc).__name__}")
+            net = diagnose_request_exception(exc, method="GET")
+            return {
+                "ok": False, "output_dir": config.output_dir, "summary_file": None,
+                "total_files": 0, "challenges_processed": 0,
+                "elapsed_seconds": time.time() - start_time,
+                "bqa_error_code": "CTF-PULL-D14" if net.code != "unknown-error" else "CTF-PULL-D04",
+                "bqa_evidence": PullService._platform_recon_evidence(platform),
+            }
+        if not challenges:
+            PullService._render_no_challenges()
+            info = getattr(platform, "info", None)
+            is_unknown = (getattr(info, "platform_type", None) == "generic_html"
+                          and getattr(info, "confidence", None) == "low")
+            return {
+                "ok": False,
+                "output_dir": config.output_dir,
+                "summary_file": None,
+                "total_files": 0,
+                "challenges_processed": 0,
+                "elapsed_seconds": time.time() - start_time,
+                "bqa_error_code": "CTF-PULL-D02" if is_unknown else "CTF-PULL-D03",
+                "bqa_evidence": PullService._platform_recon_evidence(platform),
+            }
+
+        # Auto-determine output_dir under ~/Workspace/CTF/<CTF_Title> if not explicitly specified
+        from ..utils.sanitize import sanitize_ctf_title
+        if not config.output_dir:
+            ctf_title = platform.ctf_info.title or ""
+            folder_name = sanitize_ctf_title(ctf_title, fallback_domain=config.url)
+            from ..storage.global_config import resolve_workspace_root
+            base_ctf_dir = resolve_workspace_root()
+            config.output_dir = os.path.abspath(os.path.join(base_ctf_dir, folder_name))
+
+        if config.cookie or config.token:
+            try:
+                from .auth_service import AuthService
+                AuthService.save_auth(
+                    workspace=config.output_dir,
+                    url=config.url,
+                    cookie=config.cookie,
+                    token=config.token,
+                )
+            except Exception:
+                pass
+
+        git_prepare = PullService._prepare_git_workflow(config, platform)
+        Logger.info(f"Output Directory: [path]{escape(config.output_dir)}[/path]", markup=True)
+
+        # Filter categories if specified
+        if config.categories:
+            cats = [c.lower() for c in config.categories]
+            challenges = [c for c in challenges if c.category.lower() in cats]
+
+        if config.exclude_categories:
+            ex_cats = [c.lower() for c in config.exclude_categories]
+            challenges = [c for c in challenges if c.category.lower() not in ex_cats]
+
+        if not challenges:
+            render_diagnostic(Diagnostic(
+                "error",
+                "Filter đã loại toàn bộ challenge",
+                hints=("kiểm tra --category và --exclude",),
+            ))
+            return {
+                "ok": False, "output_dir": config.output_dir, "summary_file": None,
+                "total_files": 0, "challenges_processed": 0,
+                "elapsed_seconds": time.time() - start_time,
+                "bqa_error_code": "CTF-PULL-D05",
+            }
+
+        # Display found summary — ok_summary đã in bởi _fetch_challenges_ui;
+        # giữ nguyên bảng overview theo category.
+        categories_dict: Dict[str, int] = {}
+        for c in challenges:
+            categories_dict[c.category] = categories_dict.get(c.category, 0) + 1
+
+        rows = [[cat, str(count)] for cat, count in sorted(categories_dict.items())]
+        Logger.print_table("CTF Challenges Overview", ["Category", "Count"], rows)
+
+        # 4. Process Each Challenge
+        try:
+            os.makedirs(config.output_dir, exist_ok=True)
+        except OSError as exc:
+            PullService._render_workspace_write_failure(exc)
+            return {"ok": False, "output_dir": config.output_dir,
+                    "summary_file": None, "total_files": 0,
+                    "challenges_processed": 0,
+                    "elapsed_seconds": time.time() - start_time,
+                    "bqa_error_code": "CTF-PULL-D11"}
+        all_download_results: Dict[Any, List[Dict[str, Any]]] = {}
+        failed_challenges = 0
+        failure_codes: List[str] = []
+
+        # C19-M3: consent file lớn hỏi GỘP trên main thread TRƯỚC thread
+        # pool — worker không bao giờ input() chồng prompt lên nhau.
+        shared_consent = PullService._plan_consents(config, master, challenges)
+
+        with thread_local_sessions(master) as get_session:
+            with Progress(
+                _BrailleSpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                MofNCompleteColumn(),
+                TimeElapsedColumn(),
+                console=err_console,
+                transient=False
+            ) as progress:
+                task_id = progress.add_task("Đang tải đề & dựng workspace...",
+                                            total=len(challenges))
+
+                def process_single_challenge(chall: Challenge) -> tuple:
+                    # Session riêng của thread này (copy cookie/header từ master);
+                    # DownloadManager gắn với session đó -> an toàn đa luồng.
+                    dl_results = PullService._full_process(
+                        config, get_session(), chall,
+                        consent_state=shared_consent)
+                    return (chall.id, dl_results)
+
+                # Use ThreadPoolExecutor for concurrent challenge downloads
+                with ThreadPoolExecutor(max_workers=config.threads) as executor:
+                    future_to_chall = {
+                        executor.submit(process_single_challenge, chall): chall for chall in challenges
+                    }
+
+                    for future in as_completed(future_to_chall):
+                        chall = future_to_chall[future]
+                        try:
+                            chall_id, results = future.result()
+                            all_download_results[chall_id] = results
+                            if any(not item.get("success") for item in results):
+                                failure_codes.append(PullService._download_failure_code(results))
+                        except Exception as exc:
+                            Logger.error(f"Error processing '{chall.name}': {type(exc).__name__}")
+                            all_download_results[chall.id] = []
+                            failed_challenges += 1
+                            failure_codes.append("CTF-PULL-D09")
+                        finally:
+                            progress.advance(task_id)
+
+            if failed_challenges and failed_challenges == len(challenges):
+                PullService._render_total_download_failure(
+                    failed_challenges, len(challenges))
+
+        # 5. Generate Top-level Summary
+        Logger.info("Generating global SUMMARY.md and challenges.json...")
+        summary_file = SummaryGenerator.generate_summary(
+            base_output_dir=config.output_dir,
+            ctf_info=platform.ctf_info,
+            all_results=all_download_results
+        )
+
+        elapsed = time.time() - start_time
+        total_files = sum(sum(1 for f in res if f.get("success")) for res in all_download_results.values())
+        failed_files = sum(sum(1 for f in res if not f.get("success")) for res in all_download_results.values())
+        pull_incomplete = bool(failed_challenges or failed_files)
+
+        # 6. Sync solve attribution từ server (spec §4): server báo solved mà
+        # local chưa → nâng solve + stamp synced_at. KHÔNG BAO GIỜ hạ trạng thái.
+        try:
+            synced = PullService.sync_solve_attribution(platform, config.output_dir)
+            if synced:
+                Logger.info(f"🔄 Đã đồng bộ solve attribution cho {synced} challenge(s).")
+        except Exception:
+            pass
+
+        if pull_incomplete:
+            Logger.warning(
+                f"Pull hoàn tất một phần: {failed_challenges} challenge và "
+                f"{failed_files} file chưa tải được.")
+        else:
+            Logger.success(f"[accent]✨ ALL DONE in {elapsed:.2f}s! ✨[/accent]", markup=True)
+        Logger.info(f"📁 Workspace: [path]{escape(config.output_dir)}[/path]", markup=True)
+        Logger.info(f"📊 Summary: [info]{escape(str(summary_file))}[/info]", markup=True)
+        Logger.info(f"📦 Total files downloaded: [fg.base]{total_files}[/fg.base]", markup=True)
+
+        # Event Window (spec event-window §4/§6): lần đầu pull thành công mà
+        # workspace chưa có .ctf/config.json → chạy wizard 3 câu hỏi (chỉ khi
+        # tty) + nhận diện window (platform > CTFtime) + mirror challenges.json.
+        try:
+            from .watch_service import maybe_run_event_window_wizard
+            maybe_run_event_window_wizard(config.output_dir, platform=platform)
+        except Exception:
+            pass
+
+        git_result = PullService._finalize_git_workflow(config)
+
+        return {
+            "ok": not pull_incomplete,
+            "bqa_error_code": (failure_codes[0] if failure_codes else "CTF-PULL-D10")
+            if pull_incomplete else None,
+            "output_dir": config.output_dir,
+            "summary_file": summary_file,
+            "total_files": total_files,
+            "challenges_processed": len(all_download_results),
+            "elapsed_seconds": elapsed,
+            "git": git_result,
+            "git_prepare": git_prepare,
+        }
+
+    # ------------------------------------------------------------------ #
+    # Full processing pipeline cho 1 challenge (dùng chung full-pull và
+    # incremental --update/--refresh-meta cho challenge MỚI / cần tải lại)
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _full_process(config: DownloaderConfig,
+                      download_session: Any,
+                      chall: Challenge,
+                      consent_state: Optional[ConsentState] = None
+                      ) -> List[Dict[str, Any]]:
+        """Extract links → tải attachment → dựng workspace cho 1 challenge.
+
+        ``download_session`` là session RIÊNG của thread gọi hàm này (xem
+        ``thread_local_sessions``). ``consent_state``: trạng thái consent
+        preflight dùng chung của lượt pull (C19-M3) — truyền từ caller để
+        worker tôn trọng quyết định đã hỏi gộp trên main thread.
+        Trả về danh sách download result dict.
+        LƯU Ý: đường này đi qua ``WorkspaceBuilder.create_challenge_workspace``
+        vốn GHI ĐÈ metadata.json — chỉ dùng cho challenge mới hoặc khi caller
+        đã snapshot/phục hồi các field user-owned (status, submitted_flag, ...).
+        """
+        download_manager = DownloadManager(
+            session=download_session,
+            timeout=config.timeout,
+            force=config.force_redownload,
+            size_limit_bytes=config.size_limit_bytes,
+            consent_state=consent_state,
+            verify_mode=config.verify_downloads,
+            allow_private_redirects=config.allow_private_redirects,
+        )
+
+        # Extract links & connection info
+        combined_text = f"{chall.description}\n{chall.connection_info or ''}"
+        extracted_links = LinkExtractor.extract_links_and_files(combined_text, base_url=config.url)
+        connections = LinkExtractor.extract_connection_info(combined_text)
+
+        # C19-H1: đích tải quyết định MỘT LẦN TRƯỚC khi download bằng HÀM
+        # DUY NHẤT có guard owner/-id (resolve_challenge_dir). Tự tính
+        # sanitize() riêng ở đây (cách cũ) thì hai challenge sanitize trùng
+        # tên cùng rót attachment vào một challenge/ — thread sau đè mất
+        # attachment của chủ sở hữu im lặng, còn builder lại dựng workspace
+        # ở thư mục '-<id>' khác nơi file vừa tải.
+        chall_dest_dir = WorkspaceBuilder.resolve_challenge_dir(
+            config.output_dir, chall)
+        challenge_sub_dir = os.path.join(chall_dest_dir, "challenge")
+        os.makedirs(challenge_sub_dir, exist_ok=True)
+
+        # Download files directly into challenge/ subdirectory
+        dl_results = download_manager.download_challenge_files(
+            files=chall.files,
+            extracted_links=extracted_links,
+            dest_dir=challenge_sub_dir,
+            download_third_party=config.download_third_party
+        )
+
+        # Build workspace — dùng đúng thư mục đã tính ở trên
+        WorkspaceBuilder.create_challenge_workspace(
+            base_output_dir=config.output_dir,
+            challenge=chall,
+            extracted_links=extracted_links,
+            connections=connections,
+            download_results=dl_results,
+            create_solve_template=config.create_solve_template,
+            challenge_dir=chall_dest_dir
+        )
+
+        return dl_results
+
+    # ------------------------------------------------------------------ #
+    # Consent preflight (C19-M3): quét candidate URL trước thread pool
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _collect_consent_urls(config: DownloaderConfig,
+                              challenges: List[Any]) -> List[str]:
+        """Gom mọi URL sẽ tải của lượt pull (attachment platform + link
+        third-party downloadable) để planner probe/hỏi consent gộp trước
+        khi vào thread pool."""
+        urls: List[str] = []
+        for chall in challenges:
+            for url, _name in (getattr(chall, "files", None) or []):
+                if url:
+                    urls.append(url)
+            try:
+                combined = f"{chall.description}\n{chall.connection_info or ''}"
+                links = LinkExtractor.extract_links_and_files(
+                    combined, base_url=config.url)
+            except Exception:
+                links = []
+            for link in links:
+                if getattr(link, "is_downloadable", False) and link.url:
+                    urls.append(link.url)
+        return list(dict.fromkeys(urls))
+
+    @staticmethod
+    def _plan_consents(config: DownloaderConfig, session: Any,
+                       challenges: List[Any]) -> ConsentState:
+        """Chạy preflight consent trên MAIN thread trước pool; lỗi bất kỳ
+        (mạng/mock lạ) không bao giờ chặn pipeline."""
+        state = ConsentState()
+        urls = PullService._collect_consent_urls(config, challenges)
+        if not urls or not config.size_limit_bytes:
+            return state
+        try:
+            planner = DownloadManager(
+                session=session,
+                timeout=config.timeout,
+                force=config.force_redownload,
+                size_limit_bytes=config.size_limit_bytes,
+                consent_state=state,
+                verify_mode=config.verify_downloads,
+                allow_private_redirects=config.allow_private_redirects,
+            )
+            planner.plan_consents(urls)
+        except Exception as exc:
+            Logger.warning(
+                f"Consent preflight bỏ qua (không chặn pipeline): "
+                f"{type(exc).__name__}: {str(exc)[:200]}")
+        return state
+
+    # ------------------------------------------------------------------ #
+    # Sync solve attribution (spec challenge-status-model §4)
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def sync_solve_attribution(platform: Any, output_dir: str,
+                               on_error: Optional[Callable[[str], None]] = None
+                               ) -> int:
+        """Hỏi platform ``fetch_solve_attribution`` cho mọi challenge local và
+        nâng trạng thái solve theo nguyên tắc chỉ-nâng. Trả về số challenge
+        được cập nhật. Platform không hỗ trợ → 0.
+
+        ``on_error``: callback tùy chọn nhận mô tả lỗi khi fetch raise —
+        caller (vd. watch tick) dùng để log cảnh báo; mặc định None giữ
+        hành vi cũ im-lặng-và-0."""
+        from ..storage.workspace_repo import WorkspaceRepo
+
+        repo = WorkspaceRepo(output_dir)
+        fetcher = getattr(platform, "fetch_solve_attribution", None)
+        if not callable(fetcher):
+            return 0
+
+        metas = []
+        for meta_path in repo.iter_challenges():
+            m = repo.read_metadata(meta_path)
+            # C19-M2: bản tombstone không còn đại diện cho id
+            if (m and m.get("id") is not None
+                    and not PullService._is_superseded(m)):
+                metas.append((meta_path, m))
+        if not metas:
+            return 0
+
+        try:
+            attr_map = fetcher([m.get("id") for _p, m in metas]) or {}
+        except Exception as exc:
+            if on_error is not None:
+                try:
+                    on_error(f"fetch_solve_attribution: {exc}")
+                except Exception:
+                    pass
+            return 0
+        if not isinstance(attr_map, dict):
+            return 0
+
+        updated = 0
+        now_str = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        for meta_path, _m in metas:
+            attr = attr_map.get(_m.get("id"))
+            if attr is None:
+                continue
+            if not isinstance(attr, dict):
+                # SolveAttribution dataclass (hoặc obj tương đương) → dict
+                attr = {"by_me": bool(getattr(attr, "by_me", False)),
+                        "by_team": bool(getattr(attr, "by_team", False))}
+            target = ("solved_by_me" if attr.get("by_me", False)
+                      else "solved_by_team" if attr.get("by_team", False)
+                      else "solved_other")
+
+            # Review finding: chỉ GHI khi solve rank thực sự được nâng —
+            # fetch trả cache cũ giống hệt (TTL chưa hết) thì không đụng
+            # status.json, không stamp synced_at giả "tươi" mỗi tick.
+            try:
+                before_solve = repo.read_status(meta_path)["solve"]
+            except Exception:
+                continue
+            if SOLVE_RANK.get(target, 0) <= SOLVE_RANK.get(before_solve, 0):
+                continue
+
+            def _mut(st, _target=target):
+                if SOLVE_RANK.get(_target, 0) > SOLVE_RANK.get(st["solve"], 0):
+                    st["solve"] = _target
+                    # Stamp synced_at CHỈ khi dữ liệu thật sự thay đổi.
+                    st["synced_at"] = now_str
+                return st
+
+            try:
+                # Review 3e0fbcc-F3: chỉ đếm updated khi ghi THẬT SỰ persist
+                # (StatusWriteResult.persisted=True). Noop — process khác
+                # nâng solve trước trong race, ta KHÔNG ghi gì mà state trả
+                # về vẫn báo solve mới — hoặc skip (thư mục challenge biến
+                # mất) đều phải loại để tránh đếm ảo.
+                res = repo.update_status(meta_path, _mut)
+                if (getattr(res, "persisted", True)
+                        and res.get("solve") != before_solve):
+                    updated += 1
+            except Exception:
+                continue
+        return updated
+
+    # ------------------------------------------------------------------ #
+    # Incremental pull (--update / --refresh-meta)
+    # ------------------------------------------------------------------ #
+    # Field do instance_service quản lý TRÊN ĐỊA — platform KHÔNG được đè
+    # khi cập nhật metadata động của challenge đã có.
+    _LOCAL_INSTANCE_KEYS = ("is_container", "status", "active_instance",
+                            "last_entry", "remaining_time", "last_updated")
+    # Field user-owned trong metadata.json mà incremental update không bao
+    # giờ ghi đè (phục hồi sau khi WorkspaceBuilder viết lại toàn bộ file).
+    # ``instance_info`` do instance_service quản TRÊN ĐỊA (is_container/
+    # active_instance/remaining_time) — platform không biết gì về trạng thái
+    # container local nên refresh-meta/redownload phải giữ nguyên (C9-03).
+    _USER_OWNED_META_KEYS = ("status", "submitted_flag", "instance_info", "instance")
+
+    @staticmethod
+    def run_update(config: DownloaderConfig,
+                   session: Optional[Any] = None,
+                   refresh_meta: bool = False) -> Dict[str, Any]:
+        """Pull tăng dần: chỉ xử lý đầy đủ challenge MỚI, các challenge đã có
+        chỉ cập nhật metadata động (points/solves/connection/instance + solve
+        attribution raise-only). ``refresh_meta=True`` cho phép tải lại
+        attachment của challenge đã có khi file thiếu trên đĩa.
+
+        Challenge biến mất khỏi API: giữ nguyên local, đánh dấu
+        ``removed_from_server=true`` (ghi cả trong block ``status`` lẫn mirror
+        top-level metadata.json — block status bị normalize_status cắt field
+        lạ ở lần ``update_status`` kế tiếp nên mirror top-level mới bền).
+        """
+        # Cho phép bật chế độ qua config (--refresh-meta/--update từ CLI)
+        # thay vì bắt buộc truyền kwarg.
+        refresh_meta = bool(refresh_meta or getattr(config, "refresh_meta", False))
+        config.validate()
+        start_time = time.time()
+        mode_label = "--refresh-meta" if refresh_meta else "--update"
+        Logger.info(f"Incremental pull ({mode_label})")
+
+        master = session or create_session(
+            cookie=config.cookie,
+            token=config.token,
+            custom_headers=config.custom_headers,
+            timeout=config.timeout,
+            base_url=config.url,
+            insecure=getattr(config, 'insecure', False),
+        )
+
+        # 1. Detect + Authenticate + Fetch (giống full pull)
+        try:
+            platform = PlatformDetector.detect_platform(config.url, master)
+        except Exception as exc:
+            return PullService._render_detect_failure(config, start_time, exc)
+        if not platform.authenticate():
+            PullService._render_auth_warning()
+        challenges = PullService._fetch_challenges_ui(platform)
+        if not challenges:
+            PullService._render_no_challenges()
+            return {"ok": False, "output_dir": config.output_dir,
+                    "summary_file": None, "total_files": 0,
+                    "new": 0, "updated": 0, "skipped": 0, "missing": 0,
+                    "challenges_processed": 0,
+                    "elapsed_seconds": time.time() - start_time,
+                    "bqa_error_code": "CTF-PULL-D03"}
+
+        from ..utils.sanitize import sanitize_ctf_title
+        if not config.output_dir:
+            ctf_title = platform.ctf_info.title or ""
+            folder_name = sanitize_ctf_title(ctf_title, fallback_domain=config.url)
+            from ..storage.global_config import resolve_workspace_root
+            base_ctf_dir = resolve_workspace_root()
+            config.output_dir = os.path.abspath(os.path.join(base_ctf_dir, folder_name))
+        output_dir = config.output_dir
+
+        if config.cookie or config.token:
+            try:
+                from .auth_service import AuthService
+                AuthService.save_auth(
+                    workspace=config.output_dir,
+                    url=config.url,
+                    cookie=config.cookie,
+                    token=config.token,
+                )
+            except Exception:
+                pass
+
+        git_prepare = PullService._prepare_git_workflow(config, platform)
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+        except OSError as exc:
+            PullService._render_workspace_write_failure(exc)
+            return {"ok": False, "output_dir": output_dir,
+                    "summary_file": None, "total_files": 0,
+                    "new": 0, "updated": 0, "skipped": 0, "missing": 0,
+                    "challenges_processed": 0,
+                    "elapsed_seconds": time.time() - start_time,
+                    "bqa_error_code": "CTF-PULL-D11"}
+
+        # generate_summary duyệt ctf_info.challenges — platform thật tự gắn;
+        # platform giả/mock có thể bỏ trống nên bảo đảm danh sách khớp API.
+        try:
+            if not list(getattr(platform.ctf_info, "challenges", None) or []):
+                platform.ctf_info.challenges = list(challenges)
+        except Exception:
+            pass
+
+        # 2. Phân loại: new / existing / missing (đều tôn trọng filter category)
+        def _in_scope(category: Any) -> bool:
+            cat = str(category or "").lower()
+            if config.categories and cat not in [c.lower() for c in config.categories]:
+                return False
+            if config.exclude_categories and cat in [c.lower() for c in config.exclude_categories]:
+                return False
+            return True
+
+        scoped = [c for c in challenges if _in_scope(c.category)]
+
+        from ..storage.workspace_repo import WorkspaceRepo
+        repo = WorkspaceRepo(output_dir)
+        local_index: Dict[str, tuple] = {}
+        for meta_path in repo.iter_challenges():
+            m = repo.read_metadata(meta_path)
+            cid = m.get("id")
+            # C19-M2: bản tombstone superseded_by không còn đại diện cho id
+            if cid is not None and not PullService._is_superseded(m):
+                local_index.setdefault(str(cid), (meta_path, m))
+
+        api_ids = {str(c.id) for c in scoped}
+        new_challs = [c for c in scoped if str(c.id) not in local_index]
+        existing_pairs = [(c,) + local_index[str(c.id)]
+                          for c in scoped if str(c.id) in local_index]
+        missing_items = [(cid, mp, (_m.get("name") or str(cid)))
+                         for cid, (mp, _m) in local_index.items()
+                         if cid not in api_ids and _in_scope(_m.get("category"))]
+
+        # Challenge cũ đi qua full pipeline khi:
+        # - --refresh-meta phát hiện attachment local bị thiếu; hoặc
+        # - user yêu cầu normal/strict revalidation. DownloadManager sẽ tự
+        #   skip từng file nếu validator/hash vẫn đạt, nên đây không đồng
+        #   nghĩa với việc ép tải body lại tất cả.
+        redownload: List[Challenge] = []
+        verify_existing = str(getattr(config, "verify_downloads", "fast")) != "fast"
+        for chall, _mp, m in existing_pairs:
+            needs_pipeline = bool(
+                verify_existing
+                and ((m.get("downloaded_files") or []) or getattr(chall, "files", None))
+            )
+            if refresh_meta and not needs_pipeline:
+                for df in (m.get("downloaded_files") or []):
+                    if not isinstance(df, dict):
+                        continue
+                    sp = df.get("saved_path")
+                    if df.get("success") and sp and not os.path.isfile(sp):
+                        needs_pipeline = True
+                        break
+            if needs_pipeline:
+                redownload.append(chall)
+
+        all_results: Dict[Any, List[Dict[str, Any]]] = {}
+        failed_downloads = 0
+
+        # 3. Full pipeline (threaded) cho challenge mới + cần tải lại
+        to_download = [(c, "new") for c in new_challs] + \
+                      [(c, "redownload") for c in redownload]
+        fresh_ids: set = set()
+        # C19-M3: consent gộp trên main thread cho đúng các challenge sắp tải
+        shared_consent = PullService._plan_consents(
+            config, master, [c for c, _kind in to_download])
+        if to_download:
+            with thread_local_sessions(master) as get_session:
+                with Progress(
+                    _BrailleSpinnerColumn(),
+                    TextColumn("[progress.description]{task.description}"),
+                    BarColumn(),
+                    MofNCompleteColumn(),
+                    TimeElapsedColumn(),
+                    console=err_console,
+                    transient=False
+                ) as progress:
+                    task_id = progress.add_task("Đang tải đề & dựng workspace...",
+                                                total=len(to_download))
+
+                    def _one(item):
+                        chall, _kind = item
+                        return PullService._full_process(
+                            config, get_session(), chall,
+                            consent_state=shared_consent)
+
+                    with ThreadPoolExecutor(max_workers=max(1, config.threads)) as executor:
+                        future_map = {executor.submit(_one, item): item
+                                      for item in to_download}
+                        for future in as_completed(future_map):
+                            chall, kind = future_map[future]
+                            try:
+                                dl_results = future.result()
+                                all_results[chall.id] = dl_results
+                                fresh_ids.add(str(chall.id))
+                                if kind == "redownload":
+                                    # Builder vừa viết lại metadata.json — phục hồi
+                                    # các field user-owned từ snapshot trước đó.
+                                    pass   # snapshot merge làm dưới bước 4
+                            except Exception as exc:
+                                Logger.error(f"Error processing '{chall.name}': {exc}")
+                                all_results[chall.id] = []
+                                failed_downloads += 1
+                            finally:
+                                progress.advance(task_id)
+
+            if failed_downloads and failed_downloads == len(to_download):
+                PullService._render_total_download_failure(
+                    failed_downloads, len(to_download))
+
+        # 4. Cập nhật metadata động cho mọi challenge đã có (sequential, rẻ)
+        attr_map = PullService._fetch_attribution_map(
+            platform, [c.id for c, _mp, _m in existing_pairs])
+        updated = skipped = 0
+        for chall, mp, old_meta in existing_pairs:
+            was_fresh = str(chall.id) in fresh_ids
+            meta_target = mp
+            if was_fresh:
+                # C19-M2: category/tên có thể đã đổi -> builder vừa ghi
+                # metadata vào THƯ MỤC MỚI. Phục hồi field user-owned vào
+                # file MỚI (không phải file cũ như trước đây), rồi xử lý
+                # bản cũ an toàn qua repo helper: tombstone superseded_by
+                # có kiểm (atomic + flock), KHÔNG rm trực tiếp.
+                fresh_mp = PullService._find_fresh_meta_path(repo, chall.id, mp)
+                if fresh_mp is not None:
+                    meta_target = fresh_mp
+                PullService._restore_user_fields(repo, meta_target, old_meta)
+                if os.path.abspath(meta_target) != os.path.abspath(mp):
+                    PullService._tombstone_superseded(repo, mp, meta_target)
+            changed = PullService._refresh_existing_metadata(
+                repo, meta_target, chall, attr_map)
+            updated += 1 if (changed or was_fresh) else 0
+            skipped += 0 if (changed or was_fresh) else 1
+            # all_results cho summary: kết quả tươi nếu vừa tải, nếu không giữ
+            # downloaded_files hiện có trong metadata.
+            if not was_fresh:
+                cur = repo.read_metadata(meta_target)
+                all_results[chall.id] = cur.get("downloaded_files") or []
+
+        # 5. Challenge biến mất khỏi API: đánh dấu, KHÔNG xoá gì
+        for _cid, mp, _name in missing_items:
+            PullService._mark_removed_from_server(repo, mp)
+
+        # Tổng kết diff (alphabetical): ` + name` solved-green — bài mới,
+        # ` - name` error-red — bài biến mất khỏi server (removed_from_server).
+        # Glyph +/- giữ nguyên; màu qua HẰNG HEX vì err_console không có theme.
+        diff_entries = [(c.name or str(c.id), "+") for c in new_challs] \
+            + [(_name, "-") for _cid, _mp, _name in missing_items]
+        for name, sign in sorted(diff_entries, key=lambda e: (e[0].lower(), e[1])):
+            color = _SOLVED_COLOR if sign == "+" else _ERROR_COLOR
+            err_console.print(f"[{color}]{sign} {name}[/{color}]")
+
+        # 6. Regenerate SUMMARY.md + challenges.json phản ánh danh sách mới
+        Logger.info("Regenerating global SUMMARY.md and challenges.json...")
+        summary_file = SummaryGenerator.generate_summary(
+            base_output_dir=output_dir,
+            ctf_info=platform.ctf_info,
+            all_results=all_results
+        )
+
+        elapsed = time.time() - start_time
+
+        rows = [["new", str(len(new_challs))],
+                ["updated", str(updated)],
+                ["skipped", str(skipped)],
+                ["missing", str(len(missing_items))]]
+        Logger.print_table(f"Incremental Update ({mode_label})",
+                           ["Metric", "Count"], rows)
+        Logger.success(f"📊 new={len(new_challs)} updated={updated} "
+                       f"skipped={skipped} missing={len(missing_items)}")
+
+        # Event Window wizard: tự skip nếu workspace đã có .ctf/config.json
+        # (run_event_window_wizard trả None ngay khi store.exists()).
+        try:
+            from .watch_service import maybe_run_event_window_wizard
+            maybe_run_event_window_wizard(output_dir, platform=platform)
+        except Exception:
+            pass
+
+        git_result = PullService._finalize_git_workflow(config)
+
+        return {
+            "ok": True,
+            "output_dir": output_dir,
+            "summary_file": summary_file,
+            "total_files": sum(
+                sum(1 for f in res if (f.get("success") if isinstance(f, dict) else bool(f)))
+                for res in all_results.values()),
+            "challenges_processed": len(all_results),
+            "new": len(new_challs),
+            "updated": updated,
+            "skipped": skipped,
+            "missing": len(missing_items),
+            "elapsed_seconds": elapsed,
+            "git": git_result,
+            "git_prepare": git_prepare,
+        }
+
+    # ------------------------------------------------------------------ #
+    # Helpers incremental update
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _fetch_attribution_map(platform: Any, ids: List[Any]) -> Dict[Any, Any]:
+        """Gọi ``fetch_solve_attribution`` nếu platform hỗ trợ; lỗi → {}."""
+        fetcher = getattr(platform, "fetch_solve_attribution", None)
+        if not callable(fetcher) or not ids:
+            return {}
+        try:
+            attr_map = fetcher(ids) or {}
+        except Exception:
+            return {}
+        return attr_map if isinstance(attr_map, dict) else {}
+
+    @staticmethod
+    def _refresh_existing_metadata(repo: Any, meta_path: Any, chall: Challenge,
+                                   attr_map: Dict[Any, Any]) -> bool:
+        """Cập nhật metadata ĐỘNG của 1 challenge đã có qua WorkspaceRepo
+        (atomic + flock): points/solves_count/connection_info/instance_info/
+        submit_endpoint + solved state raise-only. KHÔNG đụng solver/writeup/
+        README/status user. Trả về True nếu có gì đó thực sự thay đổi."""
+        changed = [False]
+        now_str = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+        def _mut(meta: dict) -> dict:
+            meta = dict(meta or {})
+            # Schema migration: mọi metadata có điểm để user/script lưu
+            # endpoint instance. Giá trị này local-owned nên platform refresh
+            # không được suy đoán hay ghi đè endpoint thủ công.
+            if "instance" not in meta:
+                meta["instance"] = ""
+                changed[0] = True
+            dynamic = {
+                "points": chall.points,
+                "solves_count": chall.solves_count,
+                "connection_info": chall.connection_info,
+                "submit_endpoint": chall.submit_endpoint,
+            }
+            for k, v in dynamic.items():
+                if meta.get(k) != v:
+                    meta[k] = v
+                    changed[0] = True
+            # instance_info: merge platform keys nhưng GIỮ nguyên trạng thái
+            # container do instance_service quản trên địa.
+            plat_inst = chall.instance_info if isinstance(chall.instance_info, dict) else {}
+            inst = dict(meta.get("instance_info") or {})
+            for k, v in plat_inst.items():
+                if k in PullService._LOCAL_INSTANCE_KEYS:
+                    continue
+                if inst.get(k) != v:
+                    inst[k] = v
+                    changed[0] = True
+            if inst:
+                meta["instance_info"] = inst
+            # Challenge trở lại sau khi từng bị mark removed → gỡ flag.
+            if meta.pop("removed_from_server", None) is not None:
+                changed[0] = True
+            st = meta.get("status")
+            if isinstance(st, dict) and st.pop("removed_from_server", None) is not None:
+                meta["status"] = st
+                changed[0] = True
+            return meta
+
+        try:
+            repo.update_metadata(meta_path, _mut)
+        except Exception:
+            return False
+
+        # Solved state raise-only (spec §4) qua fetch_solve_attribution.
+        attr = attr_map.get(chall.id)
+        if attr is not None:
+            if not isinstance(attr, dict):
+                attr = {"by_me": bool(getattr(attr, "by_me", False)),
+                        "by_team": bool(getattr(attr, "by_team", False))}
+            target = ("solved_by_me" if attr.get("by_me", False)
+                      else "solved_by_team" if attr.get("by_team", False)
+                      else "solved_other")
+
+            def _st_mut(st: dict) -> dict:
+                if SOLVE_RANK.get(target, 0) > SOLVE_RANK.get(st["solve"], 0):
+                    st["solve"] = target
+                    changed[0] = True
+                st["synced_at"] = now_str
+                return st
+
+            try:
+                repo.update_status(meta_path, _st_mut)
+            except Exception:
+                pass
+
+        return changed[0]
+
+    @staticmethod
+    def _mark_removed_from_server(repo: Any, meta_path: Any,
+                                  reraise_oserror: bool = False) -> None:
+        """Đánh dấu challenge biến mất khỏi API: ``status.removed_from_server``
+        + mirror top-level (mirror là bản bền — normalize_status cắt field lạ
+        trong block status ở lần update_status kế tiếp). Không xoá gì.
+
+        ``reraise_oserror``: mặc định nuốt mọi lỗi (run_update giữ hành vi
+        cũ); sync_workspace truyền True để lỗi ghi (read-only) nổi lên được
+        đếm vào write_errors."""
+        def _mut(meta: dict) -> dict:
+            meta = dict(meta or {})
+            meta["removed_from_server"] = True
+            st = dict(meta.get("status") or {}) if isinstance(meta.get("status"), dict) else {}
+            st["removed_from_server"] = True
+            meta["status"] = st
+            return meta
+
+        try:
+            repo.update_metadata(meta_path, _mut)
+        except OSError:
+            if reraise_oserror:
+                raise
+        except Exception:
+            pass
+
+    @staticmethod
+    def _restore_user_fields(repo: Any, meta_path: Any, snapshot: dict) -> None:
+        """Sau khi WorkspaceBuilder viết lại TOÀN BỘ metadata.json (full pipeline),
+        khôi phục các field user-owned (status, submitted_flag, ...) từ snapshot
+        metadata đọc TRƯỚC khi tải lại — giữ flag/solve/writeup state của user."""
+
+        def _mut(meta: dict) -> dict:
+            meta = dict(meta or {})
+            snap = snapshot if isinstance(snapshot, dict) else {}
+            for k in PullService._USER_OWNED_META_KEYS:
+                if k in snap and snap[k] is not None:
+                    meta[k] = snap[k]
+            return meta
+
+        try:
+            repo.update_metadata(meta_path, _mut)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _is_superseded(meta: Any) -> bool:
+        """C19-M2: metadata đã bị tombstone (challenge đổi category/tên ->
+        thư mục mới) — không còn đại diện cho id trong mọi index.
+
+        Review-6 HIGH: predicate chuyển về helper TẦNG REPO dùng chung
+        (:func:`storage.workspace_repo.is_superseded`) để mọi consumer lọc
+        tombstone từ MỘT nguồn; hàm này chỉ còn là alias cho caller cũ."""
+        from ..storage.workspace_repo import is_superseded
+        return is_superseded(meta)
+
+    @staticmethod
+    def _find_fresh_meta_path(repo: Any, cid: Any,
+                              previous_path: Any) -> Optional[Any]:
+        """Đường dẫn metadata MỚI của ``cid`` sau khi full-process vừa chạy —
+        loại trừ đường cũ; None nếu không có bản nào khác (category/tên
+        không đổi, builder tái sử dụng đúng thư mục cũ)."""
+        for meta_path in repo.iter_challenges():
+            if os.path.abspath(str(meta_path)) == os.path.abspath(str(previous_path)):
+                continue
+            m = repo.read_metadata(meta_path)
+            if (m and m.get("id") is not None
+                    and str(m.get("id")) == str(cid)
+                    and not PullService._is_superseded(m)):
+                return meta_path
+        return None
+
+    @staticmethod
+    def _tombstone_superseded(repo: Any, old_meta_path: Any,
+                              new_meta_path: Any) -> bool:
+        """C19-M2: sau khi challenge đổi category/tên (workspace mới), bản
+        metadata CŨ không được rm trực tiếp cũng không được để nguyên — một
+        id xuất hiện ở 2 nơi làm index/--update/solve-sync đếm đôi. Xử lý
+        CÓ KIỂM qua ``repo.update_metadata`` (atomic + flock): đánh dấu
+        ``superseded_by`` trỏ tới metadata mới (mirror cả trong block status
+        như removed_from_server — top-level là bản bền)."""
+        target = str(new_meta_path)
+
+        def _mut(meta: dict) -> dict:
+            meta = dict(meta or {})
+            if meta.get("superseded_by") != target:
+                meta["superseded_by"] = target
+                st = dict(meta.get("status") or {}) \
+                    if isinstance(meta.get("status"), dict) else {}
+                st["superseded_by"] = target
+                meta["status"] = st
+            return meta
+
+        try:
+            repo.update_metadata(old_meta_path, _mut)
+            Logger.info(
+                f"Metadata cũ {old_meta_path} đã tombstone "
+                f"(superseded_by={target}) sau khi challenge đổi category/tên.")
+            return True
+        except Exception as exc:
+            Logger.warning(
+                f"Không tombstone được metadata cũ {old_meta_path}: "
+                f"{type(exc).__name__}: {str(exc)[:200]}")
+            return False
+
+    # ------------------------------------------------------------------ #
+    # Sync 2 chiều (backlog P2-1): re-fetch metadata từ platform GIỮ NGUYÊN
+    # local state + verify drift solve. KHÔNG wire CLI trong backlog này —
+    # xem docstring ``sync_workspace`` cho cách gọi sau khi cli.py sẵn sàng.
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def sync_workspace(repo: Any, platform: Any, apply_drift: bool = False) -> Dict[str, Any]:
+        """Đồng bộ 2 chiều giữa workspace local và platform (backlog P2-1).
+
+        Nguyên tắc: LOCAL STATE LÀ CHỦ. Với mỗi challenge đã có local, chỉ
+        merge metadata ĐỘNG từ server (points/solves_count/connection_info/
+        submit_endpoint/instance_info) + stamp ``status.synced_at``; giữ nguyên
+        TUYỆT ĐỐI block ``status`` (trừ synced_at), ``submitted_flag`` và mọi
+        file trong ``challenge/``, ``solver/``, ``writeup/`` (không tải lại,
+        không dựng lại gì).
+
+        - Challenge MỚI trên server: chỉ liệt kê vào ``new_on_server`` —
+          KHÔNG tự tạo workspace (user chạy ``--update`` để pull tăng dần).
+        - Drift solve (server báo solved mà local chưa): KHÔNG tự đổi trạng
+          thái — ``PullService.verify`` liệt kê kèm tên người giải để user
+          tự quyết.
+
+        Cách gọi sau khi CLI được wire (cli.py do agent khác sở hữu)::
+
+            from ctf_downloader.storage.workspace_repo import WorkspaceRepo
+            repo = WorkspaceRepo(output_dir)
+            result = PullService.sync_workspace(repo, platform)
+            # result: {"ok", "updated", "new", "new_on_server", "drift",
+            #          "unsolved_locally_solved_remotely", "total_local",
+            #          "total_server", "removed_local", "corrupt_local",
+            #          "write_errors"} — drift == unsolved_locally_solved_
+            #          remotely (danh sách chi tiết từng bài lệch solve).
+
+        Kết quả được in dạng bảng: updated=N · new=X · drift=Y (+ chi tiết
+        từng bài drift).
+        """
+        fetcher = getattr(platform, "fetch_challenges", None)
+        challenges: List[Any] = []
+        if callable(fetcher):
+            try:
+                challenges = list(fetcher() or [])
+            except Exception:
+                challenges = []
+        if not challenges:
+            # BUG-C16-5: đủ shape keys như nhánh thành công — consumer truy
+            # cập trực tiếp result["removed_local"] v.v. không bị KeyError.
+            return {"ok": False, "updated": 0, "new": 0, "new_on_server": [],
+                    "removed_local": [], "corrupt_local": [],
+                    "write_errors": [],
+                    "drift": [], "unsolved_locally_solved_remotely": [],
+                    "total_local": 0, "total_server": 0}
+
+        local_index: Dict[str, tuple] = {}
+        corrupt_local: List[Dict[str, Any]] = []
+        for meta_path in repo.iter_challenges():
+            m = repo.read_metadata(meta_path)
+            if not m:
+                # C15-4: phân biệt metadata HỎNG (JSON không parse được / sai
+                # kiểu) với file trống thật sự — file hỏng được cảnh báo riêng
+                # (``corrupt_local``) thay vì biến mất im lặng rồi bị quảng
+                # bá "mới trên server" mà user không hay biết file đang hỏng.
+                try:
+                    raw = Path(meta_path).read_text(encoding="utf-8-sig")
+                except OSError:
+                    raw = ""
+                if raw.strip():
+                    corrupt_local.append({"path": str(meta_path)})
+                continue
+            cid = m.get("id")
+            # C19-M2: bản tombstone không còn đại diện cho id
+            if cid is not None and not PullService._is_superseded(m):
+                local_index.setdefault(str(cid), (meta_path, m))
+
+        now_str = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        new_on_server: List[Dict[str, Any]] = []
+        removed_local: List[Dict[str, Any]] = []
+        write_errors: List[str] = []
+        server_ids = {str(c.id) for c in challenges}
+        updated = 0
+
+        for chall in challenges:
+            entry = local_index.get(str(chall.id))
+            if entry is None:
+                # Challenge mới trên server: KHÔNG tạo gì — để --update xử lý.
+                new_on_server.append({"id": chall.id, "name": chall.name,
+                                      "category": chall.category})
+                continue
+            meta_path, _snapshot = entry
+            try:
+                changed = PullService._merge_dynamic_metadata(
+                    repo, meta_path, chall)
+            except OSError as exc:
+                # C15-1: workspace read-only / đĩa đầy phải lộ tín hiệu lỗi.
+                write_errors.append(f"merge {meta_path}: {exc}")
+                continue
+            except Exception as exc:
+                # Programming/data-shape failures are also partial sync
+                # failures. Do not silently convert them into a clean noop.
+                write_errors.append(
+                    f"merge {meta_path}: {type(exc).__name__}: {exc}"
+                )
+                continue
+            if changed:
+                updated += 1
+            # Stamp synced_at CHỈ khi dữ liệu thực sự đổi hoặc challenge chưa
+            # từng được stamp (C15-2): sync noop liên tiếp KHÔNG ghi lại file
+            # — không ô nhiễm synced_at/updated_at, giữ idempotence.
+            try:
+                if changed or not repo.read_status(meta_path).get("synced_at"):
+                    repo.update_status(
+                        meta_path, lambda st: {**st, "synced_at": now_str})
+            except OSError as exc:
+                write_errors.append(f"sync-stamp {meta_path}: {exc}")
+            except Exception as exc:
+                write_errors.append(
+                    f"sync-stamp {meta_path}: {type(exc).__name__}: {exc}"
+                )
+
+        # C15-3: đối xứng với --update — challenge local bị xoá khỏi giải
+        # phải được đánh dấu removed_from_server + liệt kê ra result, không
+        # bỏ mặc chỉ còn lệch số total_local vs total_server cho user trừ nhẩm.
+        for cid, (mp, m) in local_index.items():
+            if cid in server_ids:
+                continue
+            try:
+                PullService._mark_removed_from_server(repo, mp,
+                                                      reraise_oserror=True)
+                # Review-6 LOW: chỉ liệt kê "removed" khi persist THÀNH CÔNG
+                # — lỗi ghi (OSError) đã lộ qua write_errors, báo removed ở
+                # đây là nói dối bảng kết quả.
+                removed_local.append({"id": m.get("id"),
+                                      "name": m.get("name"),
+                                      "category": m.get("category"),
+                                      "path": str(mp)})
+            except OSError as exc:
+                write_errors.append(f"mark-removed {mp}: {exc}")
+            except Exception as exc:
+                write_errors.append(
+                    f"mark-removed {mp}: {type(exc).__name__}: {exc}"
+                )
+
+        verdict = PullService.verify(repo, platform)
+        drift = verdict["unsolved_locally_solved_remotely"]
+
+        applied_drift = 0
+        applied_by_me_cids = set()
+        if apply_drift and drift:
+            for d in drift:
+                mp = d.get("path")
+                if not mp:
+                    continue
+                if d.get("by_me"):
+                    applied_by_me_cids.add(str(d.get("id")))
+                target = "solved_by_me" if d.get("by_me") else "solved_by_team"
+                try:
+                    repo.update_status(
+                        mp, lambda st: {**st, "solve": target, "synced_at": now_str})
+                    repo.update_metadata(
+                        mp, lambda m: {**m, "solved_by_me": bool(d.get("by_me"))})
+                    applied_drift += 1
+                except OSError as exc:
+                    write_errors.append(f"apply-drift {mp}: {exc}")
+                except Exception as exc:
+                    write_errors.append(f"apply-drift {mp}: {type(exc).__name__}: {exc}")
+            if applied_drift > 0:
+                Logger.success(
+                    f"✅ Đã tự động cập nhật trạng thái solved từ server cho {applied_drift} challenge.")
+                verdict = PullService.verify(repo, platform)
+                drift = verdict["unsolved_locally_solved_remotely"]
+
+        # Cập nhật challenges.json nếu file đã có
+        if os.path.exists(repo.challenges_path):
+            try:
+                def _mut_challenges(data: dict) -> dict:
+                    data = dict(data or {})
+                    ch_list = data.get("challenges")
+                    if not isinstance(ch_list, list):
+                        return data
+                    server_map = {str(c.id): c for c in challenges}
+                    new_ch_list = []
+                    total_pts = 0
+                    for c_dict in ch_list:
+                        cid_str = str(c_dict.get("id"))
+                        sc = server_map.get(cid_str)
+                        if sc:
+                            c_dict["points"] = sc.points
+                            c_dict["solves_count"] = sc.solves_count
+                            c_dict["connection_info"] = sc.connection_info
+                            c_dict["submit_endpoint"] = sc.submit_endpoint
+                            if getattr(sc, "instance_info", None) and isinstance(sc.instance_info, dict):
+                                inst = dict(c_dict.get("instance_info") or {})
+                                for k, v in sc.instance_info.items():
+                                    if k not in PullService._LOCAL_INSTANCE_KEYS:
+                                        inst[k] = v
+                                c_dict["instance_info"] = inst
+                            if apply_drift:
+                                if getattr(sc, "solved_by_me", False) or (cid_str in applied_by_me_cids):
+                                    c_dict["solved_by_me"] = True
+                            elif getattr(sc, "solved_by_me", False):
+                                c_dict["solved_by_me"] = True
+                        try:
+                            total_pts += int(c_dict.get("points") or 0)
+                        except (ValueError, TypeError):
+                            pass
+                        new_ch_list.append(c_dict)
+                    data["challenges"] = new_ch_list
+                    data["total_points"] = total_pts
+                    return data
+
+                repo.mutate_challenges(_mut_challenges)
+            except Exception as exc:
+                Logger.debug(f"Không thể cập nhật challenges.json: {exc}")
+
+        result = {
+            # Partial persist/corrupt-local state is NOT a successful sync for
+            # CLI/automation purposes. Keep detailed partial results so the
+            # user can recover, but return non-zero through handle_sync.
+            "ok": not write_errors and not corrupt_local,
+            "updated": updated,
+            "new": len(new_on_server),
+            "new_on_server": new_on_server,
+            "removed_local": removed_local,
+            "corrupt_local": corrupt_local,
+            "write_errors": write_errors,
+            "drift": drift,
+            "unsolved_locally_solved_remotely": drift,
+            "total_local": len(local_index),
+            "total_server": len(challenges),
+        }
+
+        # Bảng kết quả: updated=N · new=X · drift=Y (+ chi tiết drift).
+        Logger.print_table("Workspace Sync", ["Metric", "Count"],
+                           [["updated", str(updated)],
+                            ["new", str(len(new_on_server))],
+                            ["removed", str(len(removed_local))],
+                            ["drift", str(len(drift))]])
+        if new_on_server:
+            Logger.info("🆕 Challenge mới trên server (chạy --update để tải): "
+                        + ", ".join(str(c["name"]) for c in new_on_server))
+        if removed_local:
+            Logger.warning("➖ Challenge local không còn trên server (đã mark "
+                           "removed_from_server, KHÔNG xoá file): "
+                           + ", ".join(f"{c.get('name')} (id={c.get('id')})"
+                                       for c in removed_local))
+        if corrupt_local:
+            Logger.warning(
+                "⚠️ metadata.json hỏng (không đọc được JSON) tại: "
+                + ", ".join(c["path"] for c in corrupt_local)
+                + " — chạy '--update' để dựng lại hoặc khôi phục thủ công.")
+        if write_errors:
+            Logger.warning(
+                f"⚠️ Sync ghi THẤT BẠI trên {len(write_errors)} thao tác "
+                f"(workspace read-only / đĩa đầy?) — dữ liệu local CHƯA được "
+                f"cập nhật: " + "; ".join(write_errors[:5])
+                + ("…" if len(write_errors) > 5 else ""))
+        if drift:
+            d_rows = [[f"{d.get('name')} ({d.get('category')})",
+                       "me" if d["by_me"] else "team",
+                       ", ".join(d["solver_names"]) or "(không rõ)"]
+                      for d in drift]
+            Logger.print_table("Drift — solved trên server, local chưa",
+                               ["Challenge", "By", "Solvers"], d_rows)
+            Logger.warning("⚠️ KHÔNG tự đổi trạng thái — dùng 'ctf sync --apply' để tự động cập nhật "
+                           "hoặc 'ctf status set <id> solved'.")
+        return result
+
+    @staticmethod
+    def verify(repo: Any, platform: Any) -> Dict[str, Any]:
+        """So trạng thái solved-local vs server attribution (spec §4, P2-1).
+
+        Challenge server báo đã giải (``by_me``/``by_team``) mà local còn ở
+        mức dưới ``solved_other`` (unsolved/working) → liệt kê vào
+        ``unsolved_locally_solved_remotely`` kèm tên người giải lấy từ
+        ``SolveAttribution.solver_names``. KHÔNG BAO GIỜ tự sửa trạng thái —
+        user quyết. Platform không hỗ trợ ``fetch_solve_attribution`` → rỗng.
+
+        Returns:
+            {"ok", "checked", "unsolved_locally_solved_remotely": [
+                {"id", "name", "category", "by_me", "by_team",
+                 "solver_names", "local_solve", "path"}]}
+        """
+        empty = {"ok": True, "checked": 0, "unsolved_locally_solved_remotely": []}
+        metas: List[tuple] = []
+        for meta_path in repo.iter_challenges():
+            m = repo.read_metadata(meta_path)
+            # C19-M2: bản tombstone không còn đại diện cho id
+            if (m and m.get("id") is not None
+                    and not PullService._is_superseded(m)):
+                metas.append((meta_path, m))
+        if not metas:
+            return empty
+
+        attr_map = PullService._fetch_attribution_map(
+            platform, [m.get("id") for _p, m in metas])
+        if not attr_map:
+            return {"ok": True, "checked": len(metas),
+                    "unsolved_locally_solved_remotely": []}
+
+        threshold = SOLVE_RANK.get("solved_other", 2)
+        drift: List[Dict[str, Any]] = []
+        for meta_path, m in metas:
+            raw = attr_map.get(m.get("id"))
+            if raw is None:
+                continue
+            if isinstance(raw, dict):
+                attr = {"by_me": bool(raw.get("by_me")),
+                        "by_team": bool(raw.get("by_team")),
+                        "solver_names": list(raw.get("solver_names") or [])}
+            else:
+                # SolveAttribution dataclass (hoặc obj tương đương) → dict
+                attr = {"by_me": bool(getattr(raw, "by_me", False)),
+                        "by_team": bool(getattr(raw, "by_team", False)),
+                        "solver_names": list(getattr(raw, "solver_names", None) or [])}
+            if not (attr["by_me"] or attr["by_team"]):
+                continue
+            try:
+                st = repo.read_status(meta_path)
+            except Exception:
+                continue
+            if SOLVE_RANK.get(st.get("solve"), 0) >= threshold:
+                continue   # local đã biết là solved (self/team/other) — không drift
+            drift.append({"id": m.get("id"), "name": m.get("name"),
+                          "category": m.get("category"),
+                          "by_me": attr["by_me"], "by_team": attr["by_team"],
+                          "solver_names": attr["solver_names"],
+                          "local_solve": st.get("solve"),
+                          "path": str(meta_path)})
+
+        return {"ok": True, "checked": len(metas),
+                "unsolved_locally_solved_remotely": drift}
+
+    @staticmethod
+    def _merge_dynamic_metadata(repo: Any, meta_path: Any, chall: Challenge) -> bool:
+        """Merge metadata ĐỘNG của một challenge đã có (P2-1): points/
+        solves_count/connection_info/submit_endpoint + instance_info (bỏ qua
+        các key local-owned) qua ``repo.update_metadata`` (atomic + flock).
+        KHÔNG đụng block ``status``, ``submitted_flag`` hay bất kỳ file nào.
+        Trả về True nếu có gì thực sự thay đổi."""
+        changed = [False]
+
+        def _mut(meta: dict) -> dict:
+            meta = dict(meta or {})
+            for k, v in (("points", chall.points),
+                         ("solves_count", chall.solves_count),
+                         ("connection_info", chall.connection_info),
+                         ("submit_endpoint", chall.submit_endpoint)):
+                if meta.get(k) != v:
+                    meta[k] = v
+                    changed[0] = True
+            # instance_info: merge key platform nhưng GIỮ trạng thái container
+            # do instance_service quản trên địa.
+            plat_inst = chall.instance_info if isinstance(chall.instance_info, dict) else {}
+            inst = dict(meta.get("instance_info") or {})
+            for k, v in plat_inst.items():
+                if k in PullService._LOCAL_INSTANCE_KEYS:
+                    continue
+                if inst.get(k) != v:
+                    inst[k] = v
+                    changed[0] = True
+            if inst:
+                meta["instance_info"] = inst
+            # Challenge trở lại server sau khi từng mark removed → gỡ flag.
+            if meta.pop("removed_from_server", None) is not None:
+                changed[0] = True
+            st = meta.get("status")
+            if isinstance(st, dict) and st.pop("removed_from_server", None) is not None:
+                meta["status"] = st
+                changed[0] = True
+            return meta
+
+        try:
+            # C15-2 (idempotence): update_metadata luôn ghi đè file kể cả khi
+            # mutator không đổi gì — tính trước kết quả trên dữ liệu hiện có,
+            # giống hệt thì bỏ qua hoàn toàn (không đụng mtime/inode).
+            current = repo.read_metadata(meta_path)
+            if _mut(dict(current or {})) == current:
+                return False
+            repo.update_metadata(meta_path, _mut)
+        except OSError:
+            # C15-1: lỗi ghi đĩa (read-only/permission/ENOSPC) phải nổi lên
+            # caller để sync đếm write_errors — nuốt chửng ở đây làm mất tín
+            # hiệu thất bại (workspace read-only vẫn "ok sạch").
+            raise
+        except Exception:
+            return False
+        return changed[0]

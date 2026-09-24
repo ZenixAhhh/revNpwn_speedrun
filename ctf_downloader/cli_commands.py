@@ -1,0 +1,2953 @@
+"""Lớp command mỏng cho unified CLI: parse (ở cli.py) -> service -> render -> exit code.
+
+Quy tắc kiến trúc Phase 7: file này KHÔNG chứa ``input()`` / ``Prompt.ask`` /
+``Confirm.ask`` nào — mọi wizard interactive nằm ở tầng services
+(``InstanceService.interactive_pick`` / ``SubmitService.interactive_submit``)
+hoặc ở interactive_menu.
+"""
+import os
+import subprocess
+import sys
+import textwrap
+import time
+from collections import Counter
+from pathlib import Path
+from typing import Optional
+
+from rich.markup import escape
+from rich.console import Console
+from rich.text import Text
+
+from .bqa_recovery import PullCommandFailure
+from .config import DownloaderConfig
+from .interactive_menu import launch_interactive_menu
+from .platforms.registry import display_label
+from .services.auth_service import AuthService
+from .services.instance_service import InstanceService
+from .services.pull_service import PullService
+from .services.rank_service import RankService
+from .services.status_service import StatusService
+from .services.solver_service import SolverAlreadyRunning, SolverJob, SolverSelectionError, SolverService
+from .services.submit_service import SubmitService
+from .storage.workspace_repo import WorkspaceRepo, is_superseded
+from .ui.theme import (
+    ACCENT,
+    ACCENT as _ACCENT_COLOR,
+    ERROR as _ERROR_COLOR,
+    FG_BASE,
+    FG_FAINT as _FAINT_COLOR,
+    FG_MUTED as _MUTED_COLOR,
+    INFO as _INFO_COLOR,
+    SOLVED as _SOLVED_COLOR,
+    SUCCESS as _SUCCESS_COLOR,
+    WARN as _WARN_COLOR,
+    CATEGORY_WEB,
+    CATEGORY_CRYPTO,
+    CATEGORY_PWN,
+    CATEGORY_REV,
+    CATEGORY_FORENSICS,
+    CATEGORY_MISC,
+)
+from .utils.logger import Logger, console
+
+_CAT_COLORS = {
+    "web": CATEGORY_WEB,
+    "crypto": CATEGORY_CRYPTO,
+    "pwn": CATEGORY_PWN,
+    "pwnable": CATEGORY_PWN,
+    "reverse": CATEGORY_REV,
+    "rev": CATEGORY_REV,
+    "forensics": CATEGORY_FORENSICS,
+}
+
+
+def _category_color(cat: str) -> str:
+    c = cat.strip().lower()
+    for k, v in _CAT_COLORS.items():
+        if k in c:
+            return v
+    return CATEGORY_MISC
+
+
+def get_auth_for_workspace(ws_path: str, cookie_arg: Optional[str] = None,
+                           token_arg: Optional[str] = None):
+    """Re-export mỏng quanh AuthService.resolve (giữ tên cũ cho script legacy)."""
+    return AuthService.resolve(ws_path, cookie_arg=cookie_arg, token_arg=token_arg)
+
+
+def handle_pull(args):
+    if args.interactive or not args.url:
+        if not sys.stdin.isatty():
+            # Live-verify v4: `ctf pull </dev/null` từng nổ EOFError traceback
+            # khi rẽ vào interactive menu — non-tty thì từ chối sạch kèm hint.
+            Logger.error("Thiếu --url và stdin không phải terminal tương tác.")
+            Logger.info("Dùng `ctf pull <url>` hoặc chạy trong terminal thật "
+                        "để mở menu.")
+            sys.exit(2)
+        launch_interactive_menu()
+        return
+
+    try:
+        cookie_val = AuthService.resolve_cookie_arg(args.cookie)
+    except RuntimeError as exc:
+        Logger.error(str(exc))
+        raise PullCommandFailure("CTF-PULL-D01") from exc
+
+    token_val = args.token
+    if not cookie_val and not token_val:
+        target = args.output or args.url
+        c_saved, t_saved = AuthService.resolve(target)
+        if not c_saved and not t_saved and args.output and args.url:
+            c_saved, t_saved = AuthService.resolve(args.url)
+        cookie_val = c_saved
+        token_val = t_saved
+
+    if getattr(args, 'from_burp', False):
+        from .services.burp_service import BurpService
+        burp = BurpService(mcp_port=getattr(args, 'burp_port', 9876))
+        target_domain = args.url or args.output
+        burp_cookie = burp.get_cookie_header(target_domain)
+        if burp_cookie:
+            Logger.success(f"Successfully extracted session cookie from Burp Suite (localhost:{burp.mcp_port})")
+            cookie_val = burp_cookie
+            if getattr(args, 'save_cookie', False) or getattr(args, 'update', False) or getattr(args, 'refresh_meta', False):
+                ok = AuthService.save_auth(args.output, url=args.url, cookie=cookie_val, token=token_val)
+                if ok:
+                    Logger.info("Saved extracted session cookie to auth credentials.")
+                else:
+                    Logger.warning("Could not persist session cookie to auth credentials.")
+        else:
+            Logger.warning(f"No matching session cookie found in Burp Suite HTTP history for {target_domain}")
+
+    proxy_val = getattr(args, 'proxy', None)
+    if proxy_val:
+        os.environ['HTTP_PROXY'] = proxy_val
+        os.environ['HTTPS_PROXY'] = proxy_val
+
+    config = DownloaderConfig(
+        url=args.url,
+        cookie=cookie_val,
+        token=token_val,
+        output_dir=args.output,
+        threads=args.threads,
+        download_third_party=not args.no_third_party,
+        create_solve_template=not args.no_template,
+        force_redownload=args.force,
+        verify_downloads=getattr(args, 'verify_downloads', 'fast') or 'fast',
+        allow_private_redirects=bool(getattr(args, 'allow_private_redirects', False)),
+        timeout=args.timeout,
+        categories=args.category,
+        exclude_categories=args.exclude,
+        incremental_update=getattr(args, 'update', False) or getattr(args, 'refresh_meta', False),
+        refresh_meta=getattr(args, 'refresh_meta', False),
+        git_workflow=not getattr(args, 'no_git', False),
+        git_base_branch=getattr(args, 'git_base', 'main') or 'main',
+        git_remote=getattr(args, 'git_remote', 'origin') or 'origin',
+        git_auto_push=not getattr(args, 'no_git_push', False),
+        insecure=getattr(args, 'insecure', False),
+        proxy=proxy_val,
+    )
+
+    try:
+        if config.refresh_meta or config.incremental_update:
+            result = PullService.run_update(config, refresh_meta=config.refresh_meta)
+        else:
+            result = PullService.run(config)
+        if not result.get('ok'):
+            raise PullCommandFailure(
+                result.get("bqa_error_code", "CTF-PULL-D10"),
+                result.get("bqa_evidence"),
+            )
+    except KeyboardInterrupt:
+        # Audit màu SEMANTIC: [bold red][!] legacy → Logger.error (token
+        # error đỏ semantic, cùng pattern báo lỗi của handle_pull dưới đây).
+        Logger.error('Download đã bị huỷ bởi người dùng.')
+        sys.exit(130)
+    except PullCommandFailure:
+        raise
+    except Exception as exc:
+        Logger.error(f'Lỗi nghiêm trọng khi pull: {type(exc).__name__}')
+        raise
+
+
+def handle_status(args):
+    # Hỗ trợ `ctf status --set <target> <state>` hoặc `ctf status set <target> <state>`
+    set_args = getattr(args, 'set_solve', None)
+    if not set_args and getattr(args, 'target', None) == 'set':
+        extra = getattr(args, 'args_extra', [])
+        if len(extra) >= 2:
+            set_args = [extra[0], extra[1]]
+    if set_args:
+        repo = WorkspaceRepo(args.workspace)
+        success = StatusService.set_solve(repo, set_args[0], set_args[1])
+        if not success:
+            sys.exit(1)
+        return
+
+    if bool(getattr(args, 'solver', False)):
+        service = SolverService(args.workspace)
+        _render_solver_status(service, target=getattr(args, 'target', None),
+                              watch=bool(getattr(args, 'watch', False)))
+        return
+    repo = WorkspaceRepo(args.workspace)
+    StatusService.render_tree(
+        repo,
+        filter_cat=args.category,
+        only_unsolved=args.unsolved,
+        only_solved=args.solved,
+        only_container=args.container,
+        filter_labels=getattr(args, 'labels', None),
+        search=getattr(args, 'search', None)
+    )
+
+
+def _solver_running_label(*, animate: bool) -> str:
+    """Return a stable pipe-friendly label or a time-varying TTY spinner."""
+    if not animate:
+        return "◌ running"
+    frames = ("◴", "◷", "◶", "◵")
+    return f"{frames[int(time.monotonic() * 8) % len(frames)]} running"
+
+
+def _format_flag_compact(flag: str, max_len: int = 24) -> str:
+    """Format flag compactly for table display: PREFIX{head…tail}."""
+    flag = str(flag or "").strip()
+    if not flag:
+        return ""
+    if len(flag) <= max_len:
+        return flag
+    if "{" in flag and flag.endswith("}"):
+        prefix, inner = flag.split("{", 1)
+        inner = inner[:-1]
+        if len(inner) > 8:
+            return f"{prefix}{{{inner[:4]}…{inner[-4:]}}}"
+    return f"{flag[:max_len - 5]}…{flag[-4:]}"
+
+
+def _get_challenge_flag(service: SolverService, job: SolverJob, state: dict) -> str | None:
+    """Compatibility wrapper around the shared local-flag detector."""
+    return service.get_local_flag(job, state)
+
+
+class SolverTableView:
+    """Live Radar renderable matching StatusService (Tree View) phosphor layout."""
+
+    def __init__(
+        self,
+        sections: list[tuple[Text, list[Text]]],
+        header_line: Text | None = None,
+        title: str | None = None,
+        overview_panel: object = None,
+    ):
+        self.sections = sections
+        self.header_line = header_line
+        self.title = title
+        self.overview_panel = overview_panel
+
+    def __rich_console__(self, console, options):
+        if self.overview_panel is not None:
+            yield self.overview_panel
+        elif self.title:
+            dot_style = _SOLVED_COLOR if (" 0 workers" not in (self.title or "")) else _FAINT_COLOR
+            title_text = Text()
+            title_text.append("● ", style=dot_style)
+            title_text.append(self.title, style=f"bold {FG_BASE}")
+            yield title_text
+
+        if self.header_line:
+            yield self.header_line
+
+        if not self.sections:
+            yield Text("  (no challenges found)", style=_FAINT_COLOR)
+            return
+
+        for heading, rows in self.sections:
+            yield heading
+            for row in rows:
+                yield row
+
+    def _get_items(self):
+        items = []
+        if self.overview_panel is not None:
+            items.append(self.overview_panel)
+        elif self.title:
+            dot_style = _SOLVED_COLOR if (" 0 workers" not in (self.title or "")) else _FAINT_COLOR
+            title_text = Text()
+            title_text.append("● ", style=dot_style)
+            title_text.append(self.title, style=f"bold {FG_BASE}")
+            items.append(title_text)
+        if self.header_line:
+            items.append(self.header_line)
+        if not self.sections:
+            items.append(Text("  (no challenges found)", style=_FAINT_COLOR))
+        else:
+            for heading, rows in self.sections:
+                items.append(heading)
+                items.extend(rows)
+        return items
+
+    def __rich__(self):
+        from rich.console import Group
+        return Group(*self._get_items())
+
+    def __str__(self) -> str:
+        return "\n".join(
+            item.plain if hasattr(item, "plain") else str(item)
+            for item in self._get_items()
+        )
+
+    @property
+    def plain(self) -> str:
+        return str(self)
+
+
+def _solver_table(
+    service: SolverService,
+    *,
+    jobs: list[SolverJob] | None = None,
+    animate: bool | None = None,
+    show_worker_count: bool = False,
+):
+    """Current solver rows grouped by category matching StatusService (Tree View) layout."""
+    from rich.cells import cell_len
+    from .ui.widgets import meter, SOLVE_RAMP
+
+    if animate is None:
+        animate = bool(console.is_terminal)
+    if show_worker_count:
+        service.recover_stale_jobs()
+
+    labels = {
+        "queued": ("○ queued", _MUTED_COLOR),
+        "starting": ("◌ starting", _WARN_COLOR),
+        "running": (_solver_running_label(animate=animate), _WARN_COLOR),
+        "completed": ("✔ completed", _SOLVED_COLOR),
+        "failed": ("! failed", _ERROR_COLOR),
+        "filtered": ("! filtered", _ERROR_COLOR),
+        "skipped_no_source": ("— no source", _FAINT_COLOR),
+        "skipped_no_input": ("— no input", _FAINT_COLOR),
+        "skipped_platform_solved": ("— platform", _FAINT_COLOR),
+        "skipped_local_flag": ("— hoarded", _FAINT_COLOR),
+        "skipped_active": ("◌ active", _WARN_COLOR),
+        "cancelled": ("— cancelled", _FAINT_COLOR),
+    }
+    outcome_labels = {
+        "solved_local": ("★ solved", _SOLVED_COLOR),
+        "candidate_found": ("⚑ candidate", _WARN_COLOR),
+        "analyzed": ("✦ analyzed", _INFO_COLOR),
+    }
+
+    if jobs is None:
+        jobs = list(service.scan())
+    job_data = []
+    cat_stats: dict[str, dict[str, int]] = {}
+    active_workers = 0
+
+    for job in jobs:
+        state = service.read_job(job)
+        eligibility = service.queue_eligibility(job, state)
+        flag = eligibility.local_flag
+        value = str(state.get("state") or "idle")
+        if value in ("starting", "running"):
+            active_workers += 1
+
+        is_solved = bool(job.is_solved or flag)
+        cat = job.category
+        if cat not in cat_stats:
+            cat_stats[cat] = {"total": 0, "solved": 0}
+        cat_stats[cat]["total"] += 1
+        if is_solved:
+            cat_stats[cat]["solved"] += 1
+        job_data.append((job, state, eligibility, flag, is_solved))
+
+    cols = StatusService._tty_columns()
+    if cols < 60:
+        name_limit = 14
+        hdr_cells = [
+            Text(""),
+            Text("ID", style=_FAINT_COLOR),
+            Text("CHALLENGE", style=_FAINT_COLOR),
+            Text("STATE", style=_FAINT_COLOR),
+        ]
+        aligns = ["left", "right", "left", "left"]
+        gaps = [1, 2, 2, 2]
+    elif cols < 90:
+        name_limit = 18
+        hdr_cells = [
+            Text(""),
+            Text("ID", style=_FAINT_COLOR),
+            Text("CHALLENGE", style=_FAINT_COLOR),
+            Text("STATE", style=_FAINT_COLOR),
+            Text("OUTCOME", style=_FAINT_COLOR),
+            Text("PHASE", style=_FAINT_COLOR),
+        ]
+        aligns = ["left", "right", "left", "left", "left", "left"]
+        gaps = [1, 2, 2, 2, 2, 2]
+    else:
+        name_limit = 24
+        hdr_cells = [
+            Text(""),
+            Text("ID", style=_FAINT_COLOR),
+            Text("CHALLENGE", style=_FAINT_COLOR),
+            Text("STATE", style=_FAINT_COLOR),
+            Text("OUTCOME", style=_FAINT_COLOR),
+            Text("SRC", style=_FAINT_COLOR),
+            Text("INST", style=_FAINT_COLOR),
+            Text("PHASE", style=_FAINT_COLOR),
+        ]
+        aligns = ["left", "right", "left", "left", "left", "center", "center", "left"]
+        gaps = [1, 2, 2, 2, 2, 2, 2, 2]
+
+    all_raw_rows = [hdr_cells]
+    cat_rows_map: dict[str, list[list[Text]]] = {}
+
+    for job, state, eligibility, flag, is_solved in job_data:
+        value = str(state.get("state") or "idle")
+        shown, style = labels.get(value, ("· idle", _FAINT_COLOR))
+        outcome_val = str(state.get("outcome") or "")
+
+        chal_style = _MUTED_COLOR if is_solved else FG_BASE
+
+        if job.is_solved and flag:
+            shown_outcome, outcome_style = ("✔+★", _SOLVED_COLOR)
+        elif job.is_solved:
+            shown_outcome, outcome_style = ("✔ platform", _SOLVED_COLOR)
+        elif flag:
+            shown_outcome, outcome_style = ("★ solved", _SOLVED_COLOR)
+        elif outcome_val:
+            shown_outcome, outcome_style = outcome_labels.get(
+                outcome_val, (outcome_val, _FAINT_COLOR)
+            )
+        else:
+            shown_outcome, outcome_style = ("–", _FAINT_COLOR)
+
+        phase = str(state.get("phase") or "-")
+        msg = str(state.get("message") or "")
+
+        if flag:
+            phase_text = Text(f"★ {_format_flag_compact(flag)}", style=_SOLVED_COLOR)
+        elif job.is_solved:
+            phase_text = Text("✔ platform", style=_SOLVED_COLOR)
+        elif state.get("error_code"):
+            phase_text = Text(str(state["error_code"]), style=_ERROR_COLOR)
+        elif eligibility.reason == "ready" and value == "idle":
+            phase_text = Text("ready", style=_INFO_COLOR)
+        elif eligibility.reason == "no_input" and value == "idle":
+            phase_text = Text("no input", style=_FAINT_COLOR)
+        elif msg and phase in ("running", "starting"):
+            phase_text = Text(f"{phase} · {msg[:35]}", style=_WARN_COLOR)
+        elif msg and phase not in ("-", "queued", "completed", "failed", "filtered", "cancelled", "skipped"):
+            phase_text = Text(f"{phase} · {msg[:25]}", style=_FAINT_COLOR)
+        else:
+            phase_text = Text(phase, style=_FAINT_COLOR)
+
+        if is_solved:
+            glyph = Text("✔", style=_SOLVED_COLOR)
+        elif value in ("running", "starting"):
+            glyph = Text("●", style=_WARN_COLOR)
+        elif value in ("failed", "filtered"):
+            glyph = Text("!", style=_ERROR_COLOR)
+        elif value in ("cancelled", "skipped_no_source", "skipped_no_input", "skipped_platform_solved", "skipped_local_flag"):
+            glyph = Text("—", style=_FAINT_COLOR)
+        elif value == "queued":
+            glyph = Text("○", style=_MUTED_COLOR)
+        else:
+            glyph = Text("·", style=_FAINT_COLOR)
+
+        src_cell = Text("✓", style=_MUTED_COLOR) if job.has_source else Text("–", style=_FAINT_COLOR)
+        inst_cell = Text("✓", style=_INFO_COLOR) if job.has_instance else Text("–", style=_FAINT_COLOR)
+
+        name_truncated = StatusService._truncate_cells(job.name, limit=name_limit)
+        name_cell = Text(name_truncated, style=chal_style)
+
+        if cols < 60:
+            row_cells = [
+                glyph,
+                Text(str(job.display_id), style=_FAINT_COLOR),
+                name_cell,
+                Text(shown, style=style),
+            ]
+        elif cols < 90:
+            row_cells = [
+                glyph,
+                Text(str(job.display_id), style=_FAINT_COLOR),
+                name_cell,
+                Text(shown, style=style),
+                Text(shown_outcome, style=outcome_style),
+                phase_text,
+            ]
+        else:
+            row_cells = [
+                glyph,
+                Text(str(job.display_id), style=_FAINT_COLOR),
+                name_cell,
+                Text(shown, style=style),
+                Text(shown_outcome, style=outcome_style),
+                src_cell,
+                inst_cell,
+                phase_text,
+            ]
+        all_raw_rows.append(row_cells)
+        cat_rows_map.setdefault(job.category, []).append(row_cells)
+
+    aligned_lines = StatusService._aligned_grid(all_raw_rows, aligns, gaps=gaps) if all_raw_rows else []
+
+    header_line = None
+    if aligned_lines:
+        header_line = Text("  ") + aligned_lines[0]
+        header_line.no_wrap = True
+
+    target_width = min(88, max(40, cols - 4))
+    sections: list[tuple[Text, list[Text]]] = []
+    idx = 1
+    for cat, raw_rows in cat_rows_map.items():
+        st = cat_stats[cat]
+        s_cnt, t_cnt = st["solved"], st["total"]
+        pct = (s_cnt / t_cnt * 100) if t_cnt > 0 else 0
+        m = meter(pct, 10, SOLVE_RAMP)
+        pct_color = _SOLVED_COLOR if pct == 100 else (_WARN_COLOR if pct > 0 else _FAINT_COLOR)
+
+        head = Text()
+        head.append("┌┐ ", style="accent.deep")
+        head.append(str(cat).upper(), style=f"bold {_category_color(cat)}")
+        tail = Text()
+        tail.append("  ")
+        tail.append(f"{s_cnt}/{t_cnt} ", style=f"bold {FG_BASE}")
+        tail.append_text(m)
+        tail.append(" ")
+        tail.append(f"{pct:3.0f}%", style=f"bold {pct_color}")
+
+        pad = target_width - cell_len(head.plain) - cell_len(tail.plain)
+        head.append(" ", style="accent.deep")
+        head.append("─" * max(1, pad), style="accent.deep")
+        head.append_text(tail)
+        head.no_wrap = True
+
+        rendered_cat_rows = []
+        for line in aligned_lines[idx : idx + len(raw_rows)]:
+            row_line = Text("  ") + line
+            row_line.no_wrap = True
+            rendered_cat_rows.append(row_line)
+        idx += len(raw_rows)
+
+        sections.append((head, rendered_cat_rows))
+
+    title_val = f"Live Radar · {active_workers} worker{'s' if active_workers != 1 else ''} running" if show_worker_count else None
+    return SolverTableView(sections, header_line=header_line, title=title_val)
+
+
+def _make_solver_overview_panel(service: SolverService, jobs: list[SolverJob] | None = None):
+    """Overview panel with gradient solve meter, hoarded flags, and active workers."""
+    from rich import box
+    from rich.panel import Panel
+    from rich.text import Text
+    from .ui.widgets import meter, SOLVE_RAMP
+    from .ui.theme import ACCENT_DEEP
+
+    if jobs is None:
+        jobs = service.scan()
+
+    total = len(jobs)
+    solved = 0
+    hoarded = 0
+    active = 0
+
+    for j in jobs:
+        st = service.read_job(j)
+        elig = service.queue_eligibility(j, st)
+        flag = elig.local_flag
+        if flag:
+            hoarded += 1
+        if j.is_solved or flag:
+            solved += 1
+        if str(st.get("state")) in ("starting", "running"):
+            active += 1
+
+    pct = (solved / total * 100) if total > 0 else 0
+    m = meter(pct, 20, SOLVE_RAMP)
+
+    row = Text()
+    row.append_text(m)
+    row.append(f"  {solved}/{total} solved", style=f"bold {FG_BASE}")
+    row.append(f" · {pct:.1f}%", style=_SOLVED_COLOR)
+    row.append(" · ", style=_FAINT_COLOR)
+    row.append(f"{hoarded} hoarded", style=f"bold {_SOLVED_COLOR}")
+    row.append(" · ", style=_FAINT_COLOR)
+    worker_s = "s" if active != 1 else ""
+    worker_style = f"bold {_WARN_COLOR}" if active > 0 else _FAINT_COLOR
+    row.append(f"{active} worker{worker_s} running", style=worker_style)
+
+    return Panel(
+        row,
+        box=box.ROUNDED,
+        border_style=ACCENT_DEEP,
+        title=Text(" SUPERBQA SOLVER · RADAR ", style=f"bold {FG_BASE}"),
+        expand=True,
+        padding=(0, 1),
+    )
+
+
+def _make_solver_radar_view(
+    service: SolverService,
+    *,
+    animate: bool | None = None,
+    jobs: list[SolverJob] | None = None,
+):
+    """Unified Live Radar renderable grouping overview panel and categorized table."""
+    from rich.console import Group
+
+    if jobs is None:
+        jobs = list(service.scan())
+
+    return Group(
+        _make_solver_overview_panel(service, jobs=jobs),
+        _solver_table(service, jobs=jobs, animate=animate, show_worker_count=False),
+    )
+
+
+def _render_solver_status(service: SolverService, *, target: str | None, watch: bool) -> None:
+    """Render one worker detail or a live overview without touching a worker."""
+    from rich.live import Live
+    from rich.panel import Panel
+    from rich.table import Table
+
+    try:
+        service.recover_stale_jobs()
+        daemon_info = service.get_daemon_status()
+        if daemon_info.get("is_running"):
+            d_pid = daemon_info.get("daemon_pid")
+            d_targets = daemon_info.get("target_ids", "-")
+            d_active = ", ".join(daemon_info.get("active_ids", [])) or "idle"
+            d_banner = Text()
+            d_banner.append("● SuperBQA daemon running in background ", style=f"bold {_SOLVED_COLOR}")
+            d_banner.append(f"(PID {d_pid})", style=f"bold {FG_BASE}")
+            d_banner.append(f" · Targets: {d_targets} · Active: {d_active}\n", style=_MUTED_COLOR)
+            console.print(d_banner)
+
+        cat_sessions = service.get_category_sessions()
+        if cat_sessions:
+            sess_strs = [f"{cat} ({info.get('conversation_id', '')[:8]}...)" for cat, info in cat_sessions.items()]
+            sess_text = Text()
+            sess_text.append("◈ Persistent Sessions: ", style=f"bold {ACCENT}")
+            sess_text.append(", ".join(sess_strs) + "\n", style=_FAINT_COLOR)
+            console.print(sess_text)
+
+        if target:
+            try:
+                job = service.select_ids(target)[0]
+            except SolverSelectionError as exc:
+                Logger.error(str(exc))
+                return
+
+            def _make_target_panel() -> Panel:
+                state = service.read_job(job)
+                conv_id = state.get("conversation_id")
+                reused = state.get("reused_session")
+                session_val = f"{conv_id or '-'}" + (" (reused)" if reused else "")
+
+                tbl = Table(box=None, show_header=False, pad_edge=False, expand=True)
+                tbl.add_column("Field", style=f"bold {_MUTED_COLOR}", width=18, no_wrap=True)
+                tbl.add_column("Value", style=f"{FG_BASE}")
+
+                tbl.add_row("State", str(state.get("state", "idle")))
+                tbl.add_row("Outcome", str(state.get("outcome", "-")))
+                chal_flag = _get_challenge_flag(service, job, state)
+                if chal_flag:
+                    tbl.add_row("Candidate Flag", f"[{_SOLVED_COLOR}]{chal_flag}[/{_SOLVED_COLOR}]")
+                if state.get("error_code"):
+                    tbl.add_row("Error", f"[{_ERROR_COLOR}]{state['error_code']}[/{_ERROR_COLOR}]")
+                tbl.add_row("Phase", str(state.get("phase", "-")))
+                tbl.add_row("Session", session_val)
+                tbl.add_row("Source / Instance", f"{'yes' if job.has_source else 'no'} · {'yes' if job.has_instance else 'no'}")
+                tbl.add_row("PID", str(state.get("pid", "-")))
+                tbl.add_row("Heartbeat", str(state.get("heartbeat_at", "-")))
+                tbl.add_row("Last Output", str(state.get("last_output", "-")))
+                tbl.add_row("Log Path", str(job.log_path))
+
+                return Panel(tbl, title=f"Solver {job.display_id}: {job.name}", border_style="accent.deep")
+
+            if not watch:
+                console.print(_make_target_panel())
+                return
+            with Live(_make_target_panel(), console=console, refresh_per_second=4) as live:
+                while True:
+                    time.sleep(0.25)
+                    live.update(_make_target_panel())
+
+        if not watch:
+            console.print(_make_solver_overview_panel(service))
+            console.print(_solver_table(service), soft_wrap=True)
+            return
+        with Live(_make_solver_radar_view(service), console=console, refresh_per_second=4) as live:
+            while True:
+                time.sleep(0.25)
+                live.update(_make_solver_radar_view(service))
+    except KeyboardInterrupt:
+        return
+
+
+def render_active_agy_workers(service: SolverService, console_inst=None) -> list[tuple]:
+    """Display all challenges currently running with agy workers."""
+    from rich.table import Table
+    import rich.box as box
+    from datetime import datetime, timezone
+
+    con = console_inst or console
+    service.recover_stale_jobs()
+    jobs = service.scan()
+    active_list = []
+    for j in jobs:
+        st = service.read_job(j)
+        if st.get("state") in ("running", "starting"):
+            pid = st.get("pid")
+            ticks = st.get("pid_start_ticks")
+            boot = st.get("boot_id")
+            is_alive = bool(pid and service._pid_is_alive(pid, start_ticks=ticks, boot_id=boot))
+            active_list.append((j, st, is_alive))
+
+    if active_list:
+        con.print()
+        con.print(f"  [{_SUCCESS_COLOR}]🟢 {len(active_list)} active BQA worker(s) running:[/{_SUCCESS_COLOR}]\n")
+
+        active_table = Table(
+            box=box.SIMPLE_HEAVY,
+            show_edge=False,
+            header_style=_FAINT_COLOR,
+            expand=True,
+            padding=(0, 1),
+            pad_edge=False,
+        )
+        active_table.add_column("ID", justify="right", style=_MUTED_COLOR, no_wrap=True)
+        active_table.add_column("CHALLENGE", style=FG_BASE, no_wrap=True, overflow="ellipsis")
+        active_table.add_column("CATEGORY", style=_MUTED_COLOR, no_wrap=True)
+        active_table.add_column("PID", justify="right", style=_INFO_COLOR, no_wrap=True)
+        active_table.add_column("ELAPSED", justify="right", style=_MUTED_COLOR, no_wrap=True)
+        active_table.add_column("PHASE", style=_WARN_COLOR, no_wrap=True)
+        active_table.add_column("SESSION", style=_MUTED_COLOR, no_wrap=True)
+        active_table.add_column("LAST BQA ACTIVITY", style=_MUTED_COLOR, no_wrap=True, overflow="ellipsis", ratio=1)
+
+        now = datetime.now(timezone.utc)
+        for job, st, is_alive in active_list:
+            started_str = st.get("started_at")
+            elapsed_str = "-"
+            if started_str:
+                try:
+                    started_dt = datetime.fromisoformat(str(started_str).replace("Z", "+00:00"))
+                    secs = max(0, int((now - started_dt).total_seconds()))
+                    mm, ss = divmod(secs, 60)
+                    hh, mm = divmod(mm, 60)
+                    elapsed_str = f"{hh:02d}:{mm:02d}:{ss:02d}" if hh else f"{mm:02d}:{ss:02d}"
+                except Exception:
+                    pass
+
+            conv_id = str(st.get("conversation_id") or "")
+            session_disp = (conv_id[:8] + "…") if conv_id else "new"
+            last_act = str(st.get("last_output") or st.get("message") or "analyzing...")
+            if "@@CTF_PROGRESS@@" in last_act:
+                try:
+                    import json
+                    json_part = last_act.split("@@CTF_PROGRESS@@")[1].strip()
+                    pdata = json.loads(json_part)
+                    last_act = pdata.get("message") or pdata.get("phase") or last_act
+                except Exception:
+                    pass
+
+            pid_disp = str(st.get("pid") or "-")
+            if not is_alive and pid_disp != "-":
+                pid_disp += " (stale)"
+
+            active_table.add_row(
+                str(job.display_id),
+                job.name,
+                job.category,
+                pid_disp,
+                elapsed_str,
+                str(st.get("phase") or "running"),
+                session_disp,
+                last_act,
+            )
+        con.print(active_table)
+
+        d_info = service.get_daemon_status()
+        if d_info.get("is_running"):
+            con.print(f"\n  [dim]⚙ SuperBQA Daemon: PID {d_info.get('daemon_pid')} · Targets: {d_info.get('target_ids')} · Active workers: {', '.join(d_info.get('active_ids', []))}[/dim]")
+    else:
+        con.print("\n  [dim]⚪ No active BQA workers running.[/dim]")
+
+    return active_list
+
+
+def read_log_tail(log_path: Path | str, max_bytes: int = 65536, max_lines: int = 40) -> list[str]:
+    """Read bounded trailing lines from a file without full-file read memory penalty."""
+    p = Path(log_path)
+    if not p.is_file():
+        return []
+    try:
+        with p.open("rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            seek_pos = max(0, size - max_bytes)
+            f.seek(seek_pos, os.SEEK_SET)
+            content = f.read().decode("utf-8", errors="replace")
+            lines = content.splitlines(keepends=True)
+            if seek_pos > 0 and len(lines) > 1:
+                lines = lines[1:]
+            return lines[-max_lines:]
+    except OSError:
+        return []
+
+
+def handle_solve(args):
+    """SuperBQA solver controller supporting background daemon and live modes."""
+    from rich.live import Live
+
+    service = SolverService(
+        args.workspace,
+        timeout_seconds=getattr(args, 'timeout', 3600),
+        stale_seconds=getattr(args, 'stale_timeout', 300),
+    )
+
+    # 0. Check --reset-sessions
+    if getattr(args, 'reset_sessions', False):
+        service.clear_category_sessions()
+        console.print(f"[{_SUCCESS_COLOR}]✔ Cleared persistent category sessions for this workspace.[/{_SUCCESS_COLOR}]")
+        return
+
+    # 0a. Check --active
+    if getattr(args, 'active', False):
+        render_active_agy_workers(service)
+        return
+
+    # 0b. Check --distill
+    distill_target = getattr(args, 'distill', None)
+    if distill_target is not None:
+        categories = []
+        if distill_target and distill_target != 'all':
+            categories = [distill_target.strip()]
+        else:
+            cat_sessions = service.get_category_sessions()
+            if cat_sessions:
+                categories = sorted(cat_sessions.keys())
+            else:
+                categories = sorted({j.category for j in service.scan() if j.category})
+
+        if not categories:
+            Logger.warning("No categories found to distill in this workspace.")
+            return
+
+        for cat in categories:
+            with console.status(f"[{_ACCENT_COLOR}]Distilling SOP Playbook for {cat}...[/{_ACCENT_COLOR}]"):
+                res = service.distill_playbook(cat)
+            if res.get("success"):
+                Logger.success(f"Distilled operational playbook for {cat}:")
+                console.print(f"  📄 Playbook: {res.get('playbook_path')}")
+                if res.get("main_conversation_id"):
+                    console.print(Text(f"  🧠 Updated Master Session: {res.get('main_conversation_id')}", style=_MUTED_COLOR))
+            else:
+                Logger.error(f"Failed to distill playbook for {cat}")
+        return
+
+    # 1. Check --status
+    if getattr(args, 'status', None):
+        target = None if args.status == 'all' else args.status
+        _render_solver_status(service, target=target, watch=getattr(args, 'watch', False))
+        return
+
+    # 2. Check --stop / --cancel
+    if getattr(args, 'stop', None):
+        target = None if args.stop == 'all' else args.stop
+        res = service.stop_background(target)
+        Logger.success(str(res.get('message', 'Stopped')))
+        return
+
+    # 3. Check --logs
+    if getattr(args, 'logs', None):
+        try:
+            jobs = service.select_ids(args.logs)
+        except Exception as e:
+            Logger.error(f"Selection error: {e}")
+            sys.exit(1)
+        if not jobs:
+            Logger.error(f"Challenge with ID '{args.logs}' not found.")
+            sys.exit(1)
+        job = jobs[0]
+        if not job.log_path.is_file():
+            Logger.warning(f"No log file found for {job.name}")
+            return
+        hdr = Text()
+        hdr.append("Latest log for ", style=_MUTED_COLOR)
+        hdr.append(str(job.name), style=f"bold {FG_BASE}")
+        hdr.append(f" ({job.log_path}):\n", style=_FAINT_COLOR)
+        console.print(hdr)
+        lines = read_log_tail(job.log_path, max_lines=40)
+        console.print("".join(lines), markup=False)
+        return
+
+    # 4. Check --attach
+    if getattr(args, 'attach', False):
+        console.print(Text("💡 Connecting to SuperBQA Radar. Press Ctrl+C to detach safely.\n", style=_FAINT_COLOR))
+        try:
+            with Live(_make_solver_radar_view(service), console=console, refresh_per_second=4) as live:
+                while True:
+                    time.sleep(0.25)
+                    live.update(_make_solver_radar_view(service))
+        except KeyboardInterrupt:
+            console.print(Text("\n💡 Detached from Radar. SuperBQA is continuing in background.", style=_FAINT_COLOR))
+        return
+
+    ids = getattr(args, 'ids', None)
+    if not ids:
+        console.print(_make_solver_overview_panel(service))
+        console.print(_solver_table(service))
+        if not sys.stdin.isatty():
+            Logger.error("Missing --ids and stdin is not an interactive terminal.")
+            sys.exit(1)
+        ids = service.prompt_ids()
+
+    reuse_session = not getattr(args, 'new_session', False)
+
+    # 5. Check --detach / --bg
+    if getattr(args, 'detach', False):
+        res = service.spawn_background(
+            ids,
+            workers=getattr(args, 'workers', 3),
+            timeout_seconds=getattr(args, 'timeout', 3600),
+            stale_seconds=getattr(args, 'stale_timeout', 300),
+            reuse_session=reuse_session,
+        )
+        if not res.get("success"):
+            Logger.error(res.get("message", "Background startup failed."))
+            sys.exit(1)
+        console.print(f"\n[{_SUCCESS_COLOR}]✔ {res.get('message')}[/{_SUCCESS_COLOR}]")
+        console.print("[dim]💡 Use 'ctf solve --status' or 'ctf solve --attach' to monitor progress.[/dim]")
+        console.print("[dim]💡 Use 'ctf solve --stop' to terminate workers if needed.[/dim]")
+        return
+
+    # 6. Default: Foreground execution with Live table
+    try:
+        with Live(_make_solver_radar_view(service), console=console, refresh_per_second=4) as live:
+            service.run(
+                ids,
+                workers=getattr(args, 'workers', 3),
+                on_refresh=lambda: live.update(_make_solver_radar_view(service)),
+                reuse_session=reuse_session,
+            )
+    except (SolverSelectionError, SolverAlreadyRunning) as exc:
+        Logger.error(str(exc))
+        sys.exit(1)
+    except KeyboardInterrupt:
+        Logger.info("Stopped foreground scheduler; cancelled active workers and queued jobs.")
+
+
+solve_command = handle_solve
+
+
+def handle_note(args):
+    """P1-6: ``ctf note <challenge> [content] [--remove]`` — prompt multi-line
+    nằm ở StatusService (tầng services, không input() ở lớp command)."""
+    content = ' '.join(getattr(args, 'content', None) or []).strip() or None
+    repo = WorkspaceRepo(args.workspace)
+    ok = StatusService.set_note(repo, args.target, text=content,
+                                remove=bool(getattr(args, 'remove', False)))
+    if not ok:
+        sys.exit(1)
+
+
+def handle_tag(args):
+    """P1-6: ``ctf tag <challenge> <tag...> [-r]`` — validate [a-z0-9-] ≤24."""
+    repo = WorkspaceRepo(args.workspace)
+    ok, _rejected = StatusService.update_tags(
+        repo, args.target, list(getattr(args, 'tags', None) or []),
+        remove=bool(getattr(args, 'remove', False)))
+    if not ok:
+        sys.exit(1)
+
+
+def handle_open(args):
+    """``ctf open <challenge> [-w WS]`` — mở thư mục challenge trong file
+    manager/terminal (xdg-open trên Linux).
+
+    Resolve theo cùng tier với ``WorkspaceRepo.find_challenge`` qua
+    ``StatusService.resolve_challenge`` (exact id -> exact name -> substring;
+    ambiguous -> liệt kê candidate, không partial-match âm thầm).
+    ``xdg-open`` chạy không shell=True, check=True; thiếu binary ->
+    hint cài xdg-utils."""
+    from pathlib import Path
+
+    from .services.status_service import (
+        AmbiguousChallengeError,
+        ChallengeNotFoundError,
+    )
+
+    repo = WorkspaceRepo(args.workspace)
+    try:
+        meta_path, _meta = StatusService.resolve_challenge(repo, args.target)
+    except ChallengeNotFoundError as e:
+        Logger.error(str(e))
+        sys.exit(1)
+    except AmbiguousChallengeError as e:
+        Logger.error(str(e))
+        StatusService._print_matches(e.matches)
+        sys.exit(1)
+
+    chall_dir = str(Path(meta_path).parent)
+    Logger.info(f"Đang mở thư mục challenge: {chall_dir}")
+
+    if sys.platform == "darwin":
+        opener_commands = [["open", chall_dir]]
+    elif os.name == "nt":
+        try:
+            os.startfile(chall_dir)  # type: ignore[attr-defined]
+            return
+        except OSError as exc:
+            Logger.error(f"Không mở được thư mục bằng Windows shell: {exc}")
+            sys.exit(1)
+    else:
+        # xdg-open is the freedesktop default; gio is a useful fallback on
+        # minimal/desktop Linux installs where xdg-utils isn't present.
+        opener_commands = [
+            ["xdg-open", chall_dir],
+            ["gio", "open", chall_dir],
+        ]
+
+    failures = []
+    for cmd in opener_commands:
+        try:
+            subprocess.run(cmd, check=True, shell=False)
+            return
+        except FileNotFoundError:
+            failures.append(f"{cmd[0]}: missing")
+        except subprocess.CalledProcessError as exc:
+            failures.append(f"{cmd[0]}: exit {exc.returncode}")
+        except OSError as exc:
+            failures.append(f"{cmd[0]}: {type(exc).__name__}: {exc}")
+
+    Logger.error(
+        "Không có desktop opener hoạt động ("
+        + "; ".join(failures)
+        + "). Trên Linux hãy cài xdg-utils hoặc GLib/GIO; "
+          "trên headless shell hãy cd trực tiếp vào thư mục ở trên."
+    )
+    sys.exit(1)
+
+
+def handle_workspaces(args):
+    """``ctf workspaces`` — bảng mọi workspace (PHOSPHOR, không viền dọc).
+
+    StatusService.scan_all_workspaces vẫn là nguồn dữ liệu DUY NHẤT (quy tắc
+    delegation Phase 7); log legacy ``[*] Scanning...`` + bảng cũ của service
+    được nuốt (redirect stdout) rồi handler tự vẽ: heading UPPERCASE faint +
+    path info literal, bảng borderless (box=None) và footer muted với số
+    solved dạng ``✔ N/M`` — không cyan ``[*]``, không viền kẻ dọc.
+    """
+    import contextlib
+    import io as _io
+
+    from rich.table import Table
+    from rich.text import Text as _Text
+
+    from .ui.theme import load_theme
+
+    base_dir = os.path.abspath(os.path.expanduser(args.dir))
+
+    with contextlib.redirect_stdout(_io.StringIO()):
+        try:
+            rows = list(StatusService.scan_all_workspaces(args.dir))
+        except Exception as e:
+            Logger.error(f'Không scan được workspace: {e}')
+            sys.exit(1)
+    if not rows and not os.path.exists(base_dir):
+        Logger.warning(f'Thư mục không tồn tại: {base_dir}')
+        return
+
+    ws_console = Console(theme=load_theme(None))
+    ws_console.print()
+    head = _Text("WORKSPACES", style=_FAINT_COLOR)
+    head.append("  ·  ", style=_FAINT_COLOR)
+    head.append(base_dir, style=_INFO_COLOR)   # path thật → info literal
+    ws_console.print(head)
+
+    # One workspace must stay one physical row even on narrow terminals.
+    # Fixed semantic columns consume ~39 cells including inter-column padding;
+    # the workspace column gets the remainder and ellipsizes instead of wrapping.
+    name_width = min(35, max(12, ws_console.width - 39))
+    table = Table(
+        box=None, show_header=True, show_edge=False,
+        header_style=_FAINT_COLOR, padding=(0, 1), pad_edge=False)
+    table.add_column(
+        "WORKSPACE", width=name_width, max_width=name_width,
+        no_wrap=True, overflow="ellipsis")
+    table.add_column("PLATFORM", width=10, max_width=10, no_wrap=True, overflow="ellipsis")
+    table.add_column("PROGRESS", width=15, max_width=15, no_wrap=True)
+    table.add_column("SOLVED", width=8, max_width=8, no_wrap=True, justify="right")
+
+    total_solved = 0
+    total_challs = 0
+    # N1 (synthesis-v6): title trùng giữa 2 workspace → gắn dirname faint
+    # để hàng còn phân biệt được (hiệu ứng D2: sort theo dirname ≠ title).
+    title_counts = Counter(str(s['title']) for s in rows)
+    for stats in rows:
+        total_solved += stats['solved_challenges']
+        total_challs += stats['total_challenges']
+
+        # UIv2 synthesis MUST-FIX #2: workspace giải 100% → token ``done``
+        # (strike + FG_MUTED) nhất quán với menu switcher (_workspace_rows);
+        # 0/0 (rỗng) KHÔNG tính là done.
+        is_done = (stats['total_challenges'] > 0
+                   and stats['solved_challenges'] >= stats['total_challenges'])
+        name_cell = _Text(
+            str(stats['title'])[:35],
+            style="done" if is_done else "fg.base")
+        if stats.get('_ended'):
+            name_cell.append(" · kết thúc", style=_MUTED_COLOR)
+        if title_counts[str(stats['title'])] > 1 and stats.get('_dir'):
+            name_cell.append(f" · {stats['_dir']}", style=_FAINT_COLOR)
+
+        rate = stats['completion_rate']
+        progress_cell = StatusService._meter_only(rate, 10)
+        progress_cell.append(f" {rate:.0f}%", style=_MUTED_COLOR)
+
+        # Glyph ✔ xanh CHỈ khi workspace thực sự có solve (codex-r2 P2):
+        # 0/N → số trung tính không glyph, không biến semantic thành bullet.
+        n_solved = stats['solved_challenges']
+        solved_cell = _Text()
+        if n_solved > 0:
+            solved_cell.append("✔ ", style=_SOLVED_COLOR)
+        solved_cell.append(str(n_solved), style="fg.base")
+        solved_cell.append(f"/{stats['total_challenges']}",
+                           style=_MUTED_COLOR)
+
+        table.add_row(
+            name_cell,
+            _Text(display_label(str(stats['platform'])), style=_MUTED_COLOR),
+            progress_cell,
+            solved_cell,
+        )
+
+    ws_console.print(table)
+    footer = _Text(
+        f"{len(rows)} workspace · {total_solved}/{total_challs} "
+        f"challs đã solve", style=_MUTED_COLOR)
+    ws_console.print(footer)
+    ws_console.print()
+
+
+def handle_instance(args):
+    try:
+        cookie_val, token_val = get_auth_for_workspace(
+            args.workspace, args.cookie, args.token
+        )
+        svc = InstanceService(args.workspace, cookie=cookie_val, token=token_val)
+    except Exception as e:
+        Logger.error(f'Khởi tạo thất bại: {e}')
+        sys.exit(1)
+
+    # 0. Keep-alive foreground (spec event-window §9):
+    #    --auto-extend-all → mọi container; --auto-extend → target --id/-n
+    if getattr(args, 'auto_extend_all', False) or getattr(args, 'auto_extend', False):
+        from .services.instance_keepalive import InstanceKeepAlive
+        ka = InstanceKeepAlive(svc, repo=svc.repo)
+        targets = None
+        if not getattr(args, 'auto_extend_all', False):
+            chall = svc.find_challenge(challenge_id=args.id, challenge_name=args.name)
+            if not chall:
+                Logger.error('--auto-extend cần --id hoặc -n để chỉ định challenge.')
+                sys.exit(1)
+            targets = [chall.get('id')]
+        _run_keepalive_forever(ka, targets)
+        return
+
+    # 1. List
+    if args.action == 'list' or args.list:
+        containers = svc.list_containers()
+        if not containers:
+            Logger.info('Không có challenge container động nào trong workspace.')
+            return
+        Logger.info(f'Tìm thấy {len(containers)} challenge container động:')
+        print('='*75)
+        print(f'{"ID":<8} | {"Thể loại":<12} | {"Tên":<30} | {"Solves":<8}')
+        print('='*75)
+        for c in containers:
+            solves = c.get('solves_count', c.get('solves', '-'))
+            c_id = str(c.get('id', '?'))
+            c_cat = c.get('category', 'Misc')
+            u_name = c.get('name', 'Unknown')[:30]
+            print(f"{c_id:<8} | {c_cat:<12} | {u_name:<30} | {str(solves):<8}")
+        print('='*75)
+        return
+
+    # 2. Interactive — wizard nằm ở InstanceService.interactive_pick
+    #    (dùng chung với instance.py / interactive_menu)
+    if args.interactive or (not args.action and not args.id and not args.name):
+        svc.interactive_pick()
+        return
+
+    # 3. Direct action
+    target_chall = svc.find_challenge(challenge_id=args.id, challenge_name=args.name)
+    if not target_chall:
+        Logger.error(f'Không tìm thấy challenge với ID={args.id}, Name={args.name}')
+        sys.exit(1)
+    cid = target_chall.get('id')
+
+    act = args.action or 'start'
+    if act == 'start':
+        _start_instance_with_ra_consent(svc, cid,
+                                        assume_yes=bool(getattr(args, 'yes', False)))
+    elif act == 'stop':
+        svc.stop_instance(cid)
+    elif act == 'extend':
+        svc.extend_instance(cid)
+    elif act == 'status':
+        st = svc.get_status(cid)
+        Logger.info(f'Trạng thái của ID {cid}:')
+        for k, v in st.items():
+            print(f'  {k}: {v}')
+
+    diag = getattr(svc, 'last_diagnostic', None)
+    if diag and getattr(diag, 'recovery', None):
+        from .bqa_recovery import offer_bqa_recovery
+        offer_bqa_recovery(diag)
+
+
+def handle_submit(args):
+    try:
+        cookie_val, token_val = get_auth_for_workspace(
+            args.workspace, args.cookie, args.token
+        )
+        svc = SubmitService(
+            url=args.url,
+            cookie=cookie_val,
+            token=token_val,
+            workspace_dir=args.workspace,
+            flag_format=getattr(args, 'flag_format', None)
+        )
+    except RuntimeError as exc:
+        Logger.error(str(exc))
+        sys.exit(2)
+    except Exception as exc:
+        Logger.error(f'Khởi tạo submit thất bại: {exc}')
+        sys.exit(1)
+
+    if args.auto:
+        svc.auto_submit_all(force=getattr(args, 'force', False))
+        return
+
+    chall_id = args.id or (args.target if args.target and args.target.isdecimal() else None)
+    chall_name = args.name or (args.target if args.target and not args.target.isdecimal() else None)
+    flag_value = args.flag or args.flag_val
+    force_flag = getattr(args, 'force', False)
+
+    if args.interactive or (not chall_id and not chall_name and not flag_value):
+        svc.interactive_submit(force=force_flag)
+        return
+
+    if not flag_value:
+        Logger.error('Vui lòng chỉ định flag bằng -f hoặc làm đối số.')
+        sys.exit(1)
+
+    success, message = svc.submit_single_flag(
+        challenge_id=chall_id,
+        challenge_name=chall_name,
+        flag_value=flag_value,
+        force=force_flag
+    )
+    if not success:
+        sys.exit(1)
+
+
+def _sanitize_points(raw) -> int:
+    """points metadata có thể là float('inf') (literal Infinity từ platform
+    API) / None / rác — sanitize về int >= 0, KHÔNG bao giờ raise."""
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def _age_human(iso_ts) -> str:
+    """Tuổi flag từ ``status.updated_at`` (ISO-8601 UTC 'Z') → '5m'/'3h'/'2d'.
+    Thiếu/hỏng timestamp → '-'."""
+    import datetime as dt
+
+    if not iso_ts:
+        return '-'
+    try:
+        ts = str(iso_ts).strip().replace('Z', '+00:00')
+        then = dt.datetime.fromisoformat(ts)
+        if then.tzinfo is None:
+            then = then.replace(tzinfo=dt.timezone.utc)
+        delta = dt.datetime.now(dt.timezone.utc) - then
+    except ValueError:
+        return '-'
+    secs = max(0, int(delta.total_seconds()))
+    if secs < 60:
+        return f"{secs}s"
+    mins = secs // 60
+    if mins < 60:
+        return f"{mins}m"
+    hours = mins // 60
+    if hours < 48:
+        return f"{hours}h"
+    days = hours // 24
+    if days < 30:
+        return f"{days}d"
+    return f"{days // 30}mo"
+
+
+#: Trạng thái flag được tính là "đang giữ trong kho" chờ submit.
+_HOARD_STATES = ('hoarded', 'found_unverified')
+
+
+def _collect_hoarded(repo: WorkspaceRepo) -> list:
+    """Quét workspace trả về mọi challenge đang GIỮ flag (state ∈
+    hoarded/found_unverified và có value). Mỗi dòng: name/points/state/value/
+    note/updated_at — sort điểm giảm dần (tie-break tên A→Z).
+    Bản tombstone superseded_by bị loại — flag đã được restore sang thư mục
+    sống, list không nhân đôi hàng theo id (review-6 HIGH)."""
+    rows = []
+    for meta_path in repo.iter_challenges():
+        meta = repo.read_metadata(meta_path)
+        if not meta or is_superseded(meta):
+            continue
+        st = repo.read_status(meta_path, meta=meta)
+        fl = st.get('flag') or {}
+        state = fl.get('state')
+        value = str(fl.get('value') or '').strip()
+        if state not in _HOARD_STATES or not value:
+            continue
+        rows.append({
+            'name': str(meta.get('name') or meta.get('id') or '?'),
+            'points': _sanitize_points(meta.get('points')),
+            'state': state,
+            'value': value,
+            'note': str(st.get('notes') or '').strip(),
+            'updated_at': st.get('updated_at'),
+        })
+    rows.sort(key=lambda r: (-r['points'], r['name'].lower()))
+    return rows
+
+
+def _render_hoard_list(args):
+    """``ctf hoard -w WS --list`` — bảng rich các flag đang giữ chờ submit.
+
+    PHOSPHOR như handle_workspaces: heading UPPERCASE faint, bảng borderless
+    (box=None), footer muted tổng kết ``N flags chờ submit · X điểm đang giữ``.
+    Glyph lấy TỪ STATUS_ICONS (🏴 hoarded / ❓ found_unverified); flag bị che
+    mặc định (4 ký tự đầu + ***) giống history, ``--all`` hiện đầy đủ.
+    Workspace chưa có gì → EmptyState thân thiện, KHÔNG lỗi."""
+    from rich.table import Table
+    from rich.text import Text as _Text
+
+    from .storage.constants import STATUS_ICONS
+    from .ui.theme import load_theme
+
+    ws = args.workspace
+    if not os.path.isdir(ws):
+        Logger.error(f"Workspace không tồn tại: {ws}")
+        sys.exit(1)
+    repo = WorkspaceRepo(ws)
+    entries = _collect_hoarded(repo)
+
+    ws_console = Console(theme=load_theme(None), highlight=False)
+    ws_console.print()
+    _emit_section_heading("KHO FLAG CHỜ SUBMIT", ws_console)
+
+    if not entries:
+        ws_path = os.path.abspath(ws)
+        _emit_empty_state(
+            "Kho trống — lưu flag bằng ",
+            literal="ctf hoard <challenge> <FLAG>",
+            tail=f" (workspace: {ws_path}).",
+        )
+        return
+
+    show_all = bool(getattr(args, 'show_all', False))
+    table = Table(
+        box=None, show_header=True, show_edge=False,
+        header_style=_FAINT_COLOR, padding=(0, 2), pad_edge=False)
+    table.add_column("CHALLENGE", no_wrap=False)
+    table.add_column("PTS", no_wrap=True, justify="right")
+    table.add_column("FLAG", no_wrap=True)
+    table.add_column("NOTE", no_wrap=False)
+    table.add_column("TUỔI", no_wrap=True, justify="right")
+
+    for e in entries:
+        glyph = STATUS_ICONS['flag'].get(e['state'], '❓')
+        shown = e['value'] if show_all else _redact_flag(e['value'])
+        note = e['note']
+        if len(note) > 40:
+            note = note[:39] + '…'
+        name_cell = _Text(e['name'], style="fg.base")
+        flag_cell = _Text(f"{glyph} ", style=_MUTED_COLOR)
+        flag_cell.append(shown, style="fg.base" if show_all else _MUTED_COLOR)
+        table.add_row(
+            name_cell,
+            _Text(str(e['points']), style=_MUTED_COLOR),
+            flag_cell,
+            _Text(note or '-', style=_MUTED_COLOR),
+            _Text(_age_human(e['updated_at']), style=_FAINT_COLOR),
+        )
+
+    ws_console.print(table)
+    total_pts = sum(e['points'] for e in entries)
+    footer = _Text(
+        f"{len(entries)} flags chờ submit · {total_pts} điểm đang giữ",
+        style=_MUTED_COLOR)
+    ws_console.print(footer)
+    ws_console.print()
+
+
+def _handle_hoard_remove(args):
+    """``ctf hoard <chal> --remove`` — gỡ flag khỏi kho: state về ``none``,
+    xoá value. Trục solve KHÔNG bị hạ (nguyên tắc chỉ-nâng). Resolve qua
+    StatusService.resolve_challenge (exact id → exact name → substring)."""
+    from .services.status_service import (
+        AmbiguousChallengeError,
+        ChallengeNotFoundError,
+    )
+
+    chall_id = getattr(args, 'id', None)
+    chall_name = getattr(args, 'name', None)
+    identifier = chall_id or chall_name or getattr(args, 'target', None)
+    if not identifier:
+        Logger.error("Usage: ctf hoard <challenge_id|name> --remove")
+        sys.exit(2)
+
+    repo = WorkspaceRepo(args.workspace)
+    try:
+        meta_path, meta = StatusService.resolve_challenge(repo, identifier)
+    except ChallengeNotFoundError as e:
+        Logger.error(str(e))
+        sys.exit(1)
+    except AmbiguousChallengeError as e:
+        Logger.error(str(e))
+        StatusService._print_matches(e.matches)
+        sys.exit(1)
+
+    def _mut(st):
+        st["flag"]["value"] = None
+        st["flag"]["state"] = "none"
+        return st
+
+    result = repo.update_status(meta_path, _mut)
+    shown_name = (meta or {}).get('name') or str(identifier)
+    if getattr(result, "noop", False):
+        # Review 3e0fbcc-F2: giá trị cũ == giá trị mới — không có flag nào
+        # để gỡ. Thông điệp trung tính, không phải lỗi.
+        Logger.info("Không có gì thay đổi — "
+                    f"[bold][info]{shown_name}[/info][/bold] không có flag "
+                    f"trong kho.", markup=True)
+    elif not getattr(result, "persisted", True):
+        # Ghi bị SKIP (thư mục/metadata biến mất trên đĩa): KHÔNG in
+        # 🗑 success — thất bại rõ để CLI exit nonzero.
+        Logger.error("Không gỡ được flag của "
+                     f"[bold][info]{shown_name}[/info][/bold]: thư mục "
+                     f"workspace không còn trên đĩa ({meta_path}) — ghi "
+                     f"bị bỏ qua.")
+        sys.exit(1)
+    else:
+        Logger.success("🗑 Đã gỡ flag khỏi kho cho "
+                       f"[bold][info]{shown_name}[/info][/bold].", markup=True)
+
+
+def _hoard_identifier(svc, explicit_id, candidate):
+    """Ưu tiên tra theo TÊN trước khi coi target toàn số là challenge id.
+
+    Open-code batch-3 (DEFERRED_TRIAGE #6): logic cũ dùng ``isdigit()``
+    route MỌI target toàn số thẳng sang ID nên challenge tên "1337" không
+    bao giờ tra được theo tên. Quy ước mới:
+
+      - ``--id`` tường minh luôn thắng (người dùng đã chọn rõ);
+      - candidate toàn số mà cache có key TÊN khớp chính xác
+        (case-insensitive — cùng quy ước cache của SubmitService) → dùng id
+        THẬT của entry đó để resolve downstream không nhầm;
+      - còn lại giữ hành vi cũ (toàn số = id, chữ = tên/partial-match).
+        Cache rỗng (không có challenges.json / fetch live lỗi) cũng rơi
+        về đây — không đổi behavior offline.
+    """
+    if explicit_id:
+        return explicit_id
+    text = str(candidate)
+    if text.isdigit():
+        entry = (getattr(svc, 'challenges_cache', None) or {}).get(
+            text.lower().strip())
+        real_id = entry.get('id') if isinstance(entry, dict) else None
+        if real_id is not None and str(real_id) != text:
+            return real_id
+    return candidate
+
+
+def handle_hoard(args):
+    """GAP-02 / spec §7: ``ctf hoard`` — kho flag local.
+
+    Ba nhánh:
+      - ``--list``: bảng các flag đang giữ (state=hoarded/found_unverified)
+        chờ submit; ``--all`` hiện flag đầy đủ.
+      - ``<chal> --remove``: gỡ flag khỏi kho (state về none, xoá value).
+      - mặc định: ``<chal> <FLAG>`` lưu vào kho (flag.value=x, state=hoarded)
+        KHÔNG submit lên platform — qua SubmitService.hoard_flag.
+
+    Quyết định đặt tên: tên ``flag`` theo spec đã bị ``submit`` dùng làm alias
+    (tồn tại từ trước) — nên lệnh mới là ``hoard``, alias ``flag-stash``.
+
+    Route target (open-code batch-3): tên được ưu tiên trước — target toàn
+    số chỉ coi là ID khi không có challenge nào mang đúng tên đó; ``--id``
+    tường minh vẫn thắng mọi thứ (xem :func:`_hoard_identifier`).
+    """
+    if getattr(args, 'list', False):
+        _render_hoard_list(args)
+        return
+
+    if getattr(args, 'remove', False):
+        _handle_hoard_remove(args)
+        return
+
+    chall_id = getattr(args, 'id', None)
+    candidate = getattr(args, 'name', None) or args.target
+    flag_value = args.flag or args.flag_val
+
+    if not (chall_id or candidate) or not flag_value:
+        Logger.error("Usage: ctf hoard <challenge_id|name> <FLAG>\n"
+                     "       ctf hoard -w WS --list [--all]\n"
+                     "       ctf hoard <challenge_id|name> --remove")
+        sys.exit(2)
+
+    try:
+        svc = SubmitService(workspace_dir=args.workspace)
+    except Exception as e:
+        Logger.error(f'Khởi tạo thất bại: {e}')
+        sys.exit(1)
+
+    identifier = _hoard_identifier(svc, chall_id, candidate)
+
+    ok, message = svc.hoard_flag(identifier, flag_value)
+    if not ok:
+        Logger.error(message)
+        sys.exit(1)
+
+
+def _start_instance_with_ra_consent(svc, challenge_id, assume_yes: bool = False):
+    """R-A (spec event-window §9): start/restart khi user đang GIỮ flag của
+    bài dynamic mà recreate CÓ ĐỔI FLAG (whale/platform không rõ) → bắt buộc
+    xác nhận (hoặc --yes); restart xong xoá flag cũ + state found_unverified
+    + note rotate qua InstanceKeepAlive.manual_restart_approved. GZCTF giữ
+    flag → start bình thường."""
+    from .services.instance_keepalive import InstanceKeepAlive
+
+    try:
+        ka = InstanceKeepAlive(svc, repo=getattr(svc, 'repo', None))
+        trackers = ka.discover_containers()
+    except Exception:
+        ka, trackers = None, []
+    tracker = next((t for t in trackers
+                    if str(t.challenge_id) == str(challenge_id)), None)
+
+    if tracker is None:
+        # Không phải container đang track → start thường
+        svc.start_instance(challenge_id)
+        return
+
+    flag = ka._flag_status(tracker)
+    holds_flag = bool(flag.get('value')) or flag.get('state', 'none') != 'none'
+    if holds_flag and ka.restart_rotates_flag(tracker):
+        ok, msg = ka.interactive_restart(tracker, assume_yes=assume_yes)
+        if ok:
+            Logger.success(f'🔄 Đã restart {tracker.name} — flag cũ hết hiệu lực.')
+            try:
+                svc.get_status(challenge_id)   # sync entry mới vào metadata
+            except Exception:
+                pass
+        elif msg == 'cancelled':
+            Logger.info('Đã huỷ restart — giữ nguyên flag hiện có.')
+        else:
+            Logger.error(f'Restart thất bại: {msg}')
+        return
+
+    svc.start_instance(challenge_id)
+
+
+def _run_keepalive_forever(ka, targets=None):
+    """Vòng lặp keep-alive foreground cho ``ctf instance --auto-extend[-all]``.
+
+    Ctrl-C thoát sạch. Mỗi tick poll 30-60s (state machine tự siết 5s khi
+    DUE_SOON/RENEW_FAILED)."""
+    import time as _time
+
+    from .services.instance_keepalive import InstanceKeepAlive  # noqa: F401
+
+    Logger.info('♻️ Keep-alive bật — Ctrl-C để thoát.')
+    try:
+        trackers = ka.discover_containers()
+        if targets is not None:
+            wanted = {str(t) for t in targets}
+            ka.trackers = {cid: tr for cid, tr in ka.trackers.items()
+                           if str(cid) in wanted}
+        if not ka.trackers:
+            Logger.warning('Không có container nào để keep-alive.')
+            return
+        next_poll = 0.0
+        while True:
+            events = []
+            for tracker in ka.trackers.values():
+                try:
+                    events.extend(ka.tick_one(tracker))
+                except Exception as exc:
+                    events.append(('error', f'keepalive {tracker.name}: {exc}'))
+            level_icon = {'info': '', 'warning': '⚠️ ',
+                          'error': '❌ ', 'critical': '📢 '}
+            for lv, msg in events:
+                Logger.info(f"{level_icon.get(lv, '')}{msg}")
+            # Poll interval: min các next_poll_in của tracker (30-60s bình thường,
+            # 5s khi DUE_SOON/RENEW_FAILED)
+            next_poll = min((tr.next_poll_in() for tr in ka.trackers.values()),
+                            default=45.0)
+            _time.sleep(max(2.0, next_poll))
+    except KeyboardInterrupt:
+        Logger.info('👋 Keep-alive dừng.')
+
+
+def handle_watch(args):
+    """``ctf watch`` — auto-sync trong event window + keep-alive instance."""
+    import datetime as _dt
+
+    from .services.watch_service import WatchService, parse_time_arg
+
+    try:
+        cookie_val = AuthService.resolve_cookie_arg(args.cookie)
+    except RuntimeError as exc:
+        Logger.error(str(exc))
+        sys.exit(2)
+
+    start_utc = parse_time_arg(getattr(args, 'start', None))
+    end_utc = parse_time_arg(getattr(args, 'end', None))
+    if (getattr(args, 'start', None) and start_utc is None) or \
+            (getattr(args, 'end', None) and end_utc is None):
+        Logger.error('--start/--end phải là ISO-8601 (vd 2026-08-24T09:00) '
+                     'hoặc epoch giây.')
+        sys.exit(2)
+
+    svc = WatchService(
+        workspace_path=args.workspace,
+        cookie=cookie_val,
+        token=args.token,
+        once=bool(getattr(args, 'once', False)),
+        no_scoreboard=bool(getattr(args, 'no_scoreboard', False)),
+        start_utc=start_utc,
+        end_utc=end_utc,
+    )
+    try:
+        exit_code = svc.run()
+    except KeyboardInterrupt:
+        exit_code = 130
+    if exit_code:
+        sys.exit(exit_code)
+
+
+def handle_register(args):
+    """``ctf register`` — auto-register ĐÚNG 1 tài khoản/lần chạy (spec §4).
+
+    Exit code: 0 thành công | 1 thất bại/captcha-unsupported | 2 thiếu tham số
+    hoặc đang bị rate limit."""
+    from .platforms.base import PlatformRegisterUnsupported
+    from .services.register_service import RegisterService
+
+    if not getattr(args, 'url', None):
+        Logger.error("Usage: ctf register -u <platform-url> "
+                     "[--email me@x.com | --tempmail] [--username PREFIX] "
+                     "[--password PASS] [--cf-clearance COOKIE]")
+        sys.exit(2)
+
+    svc = RegisterService()
+    try:
+        result = svc.run(
+            url=args.url,
+            email=getattr(args, 'email', None),
+            use_tempmail=bool(getattr(args, 'tempmail', False)),
+            username_prefix=getattr(args, 'username_prefix', None) or 'player',
+            password=getattr(args, 'password', None),
+            workspace=getattr(args, 'workspace', None),
+            cf_clearance=getattr(args, 'cf_clearance', None),
+        )
+    except PlatformRegisterUnsupported:
+        # Service đã in credentials + hướng dẫn thủ công — captcha không bypass.
+        sys.exit(1)
+    except RuntimeError as exc:
+        Logger.error(str(exc))
+        sys.exit(2)
+    except KeyboardInterrupt:
+        Logger.info('Đã huỷ register.')
+        sys.exit(130)
+
+    if not result.get('ok'):
+        creds = result.get('credentials') or {}
+        if creds.get('username'):
+            Logger.info(f"Credentials đã sinh (chưa dùng được): "
+                        f"{creds.get('username')} / {creds.get('password')} "
+                        f"(email: {creds.get('email')})")
+        sys.exit(1)
+
+
+def handle_doctor(args):
+    """``ctf doctor`` 🩺 — health-check platform trước giờ giải (P1-3).
+
+    Offline-safe: mỗi check tự bắt exception riêng; mạng chết vẫn render
+    đầy đủ report. Exit code: 0 chỉ khi TẤT CẢ readiness checks pass | 1 khi
+    còn ít nhất một check fail | 2 khi input CLI không hợp lệ/thiếu -u."""
+    from .services.health_service import HealthService
+
+    if bool(getattr(args, 'runtime', False)):
+        report = HealthService.check_runtime(
+            workspace=getattr(args, 'workspace', None)
+        )
+        report.render()
+        if not report.core_ok:
+            sys.exit(1)
+        return
+
+    url = getattr(args, 'url', None)
+    if not url:
+        Logger.error(
+            "Usage: ctf doctor -u <platform-url> [-w workspace] "
+            "[-c cookie] [-t token] | ctf doctor --runtime"
+        )
+        sys.exit(2)
+
+    try:
+        cookie_val = AuthService.resolve_cookie_arg(args.cookie)
+    except RuntimeError as exc:
+        Logger.error(str(exc))
+        sys.exit(2)
+
+    svc = HealthService()
+    try:
+        report = svc.check(
+            url,
+            cookie=cookie_val,
+            token=getattr(args, 'token', None),
+            workspace=getattr(args, 'workspace', None),
+        )
+    except Exception as e:
+        Logger.error(f'Doctor gặp lỗi bất ngờ: {e}')
+        sys.exit(1)
+    report.render()
+    if not report.all_passed():
+        sys.exit(1)
+
+
+def handle_rank(args):
+    try:
+        cookie_val, token_val = get_auth_for_workspace(
+            args.workspace, args.cookie, args.token
+        )
+        svc = RankService(
+            workspace_path=args.workspace,
+            url=args.url,
+            cookie=cookie_val,
+            token=token_val
+        )
+        svc.display_and_update(top_n=args.top, update_docs=not args.no_docs)
+    except Exception as e:
+        Logger.error(f'Không lấy được ranking: {e}')
+        sys.exit(1)
+
+
+def handle_sync(args):
+    """``ctf sync`` — đồng bộ metadata động workspace ↔ platform (P2-1).
+
+    Handler mỏng: auth từ auth map + dựng platform qua PlatformResolver
+    (cùng đường như InstanceService/WatchService), rồi gọi
+    ``PullService.sync_workspace(repo, platform)`` — bảng updated/new/drift
+    do service tự in. LOCAL STATE LÀ CHỦ: không đụng status/flag/file.
+    ``--verify`` chạy thêm ``PullService.verify`` in drift chi tiết.
+    """
+    from .services.platform_resolver import PlatformResolver
+
+    try:
+        cookie_val, token_val = get_auth_for_workspace(args.workspace)
+        repo = WorkspaceRepo(args.workspace)
+        _session, platform, _info = PlatformResolver.for_workspace(
+            repo, cookie=cookie_val, token=token_val)
+    except Exception as e:
+        Logger.error(f'Không resolve được platform cho workspace '
+                     f"'{args.workspace}': {e}")
+        sys.exit(1)
+
+    if getattr(args, 'pull', False):
+        try:
+            config = DownloaderConfig(
+                url=platform.ctf_info.url,
+                cookie=cookie_val,
+                token=token_val,
+                output_dir=args.workspace,
+                incremental_update=True,
+                insecure=getattr(args, 'insecure', False),
+            )
+            result = PullService.run_update(config)
+            if not result.get('ok'):
+                sys.exit(1)
+            return
+        except Exception as e:
+            Logger.error(f'Pull cập nhật thất bại: {e}')
+            sys.exit(1)
+
+    try:
+        result = PullService.sync_workspace(
+            repo, platform,
+            apply_drift=getattr(args, 'apply_drift', False),
+        )
+        if getattr(args, 'verify', False):
+            verdict = PullService.verify(repo, platform)
+            _render_verify_drift(verdict)
+    except KeyboardInterrupt:
+        Logger.info('👋 Sync dừng.')
+        sys.exit(130)
+    except Exception as e:
+        Logger.error(f'Sync thất bại: {e}')
+        sys.exit(1)
+    if not result.get('ok'):
+        sys.exit(1)
+
+
+def _render_verify_drift(verdict):
+    """In kết quả ``PullService.verify`` (dùng chung cho sync --verify)."""
+    drift = verdict.get('unsolved_locally_solved_remotely') or []
+    if not drift:
+        Logger.success('✅ Verify: không có challenge nào solved trên server '
+                       'mà local còn unsolved.')
+        return
+    rows = [[f"{d.get('name')} ({d.get('category')})",
+             'tôi' if d.get('by_me') else 'team',
+             ', '.join(d.get('solver_names') or []) or '(không rõ)']
+            for d in drift]
+    Logger.print_table(
+        'Verify — local chưa solve, server đã solve',
+        ['Challenge', 'Ai', 'Người solve'], rows)
+    Logger.warning("💡 Dùng 'ctf sync --apply' để tự động cập nhật trạng thái solved từ server vào local, "
+                   "hoặc 'ctf status set <id> solved'.")
+
+
+# Icon kết quả submit cho `ctf history` (result strings của SubmitService).
+_HISTORY_RESULT_ICONS = {
+    'correct': '🚩✔',
+    'incorrect': '⛔',
+    'ratelimited': '⏳',
+}
+
+
+def _redact_flag(flag) -> str:
+    """Che flag: 4 ký tự đầu + *** (mặc định; --all hiện đầy đủ)."""
+    flag = str(flag or '').strip()
+    if not flag:
+        return '-'
+    return flag[:4] + '***'
+
+
+def _emit_section_heading(title: str, console_=None) -> None:
+    """Heading section PHOSPHOR: UPPERCASE faint (chrome neutral)."""
+    target = console_ or console
+    target.print(Text(title.upper(), style=_FAINT_COLOR))
+
+
+def _emit_wrapped(segments, indent="  ", console_=None) -> None:
+    """In một dòng gồm nhiều ``(text, style)`` với word-wrap có chủ đích:
+    continuation line được thụt ``indent`` (2 spaces mặc định), KHÔNG treo
+    ở cột 0 khi terminal hẹp."""
+    target = console_ or console
+    width = getattr(target, 'width', None) or 80
+    avail = max(30, int(width) - len(indent))
+
+    words = []
+    for text, style in segments:
+        for word in str(text).split(" "):
+            if word:
+                words.append((word, style))
+
+    lines = []
+    current, cur_len = [], 0
+    for word, style in words:
+        extra = len(word) + (1 if current else 0)
+        if current and cur_len + extra > avail:
+            lines.append(current)
+            current, cur_len = [(word, style)], len(word)
+        else:
+            current.append((word, style))
+            cur_len += extra
+    if current:
+        lines.append(current)
+
+    for i, line_words in enumerate(lines):
+        # Manual wrapping above owns line breaks. Disable Rich's second-stage
+        # character folding so long atomic literals (workspace paths, URLs,
+        # flags) remain copy/paste-exact instead of being split mid-token.
+        line = Text("" if i == 0 else indent, no_wrap=True, overflow="ignore")
+        for j, (word, style) in enumerate(line_words):
+            if j:
+                line.append(" ")
+            line.append(word, style=style)
+        target.print(line, soft_wrap=True)
+
+
+def _emit_empty_state(message: str, literal: str = "", tail: str = "") -> None:
+    """EmptyState chung: dòng ``·`` muted + literal/path info (chỉ khi là
+    path/literal thật — không bao giờ cyan ``[*]`` trần). Wrap an toàn qua
+    :func:`_emit_wrapped`."""
+    segments = [("· ", _MUTED_COLOR), (message, _MUTED_COLOR)]
+    if literal:
+        segments.append((literal, _INFO_COLOR))
+    if tail:
+        segments.append((tail, _MUTED_COLOR))
+    _emit_wrapped(segments)
+
+
+def _format_history_ts(value) -> str:
+    """Cell ``Thời gian (UTC)`` — LUÔN trả str (print_table passthrough
+    non-str làm rich NotRenderableError crash bảng — BUG-C14-5).
+
+    Epoch số (int/float, shape mà ``status_service._solve_pulse`` chủ động
+    hỗ trợ) -> datetime UTC dễ đọc; kiểu khác -> str nguyên văn; None/rỗng
+    -> ``-``."""
+    if value is None or value == '':
+        return '-'
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        try:
+            import datetime as _dt
+            return _dt.datetime.fromtimestamp(
+                float(value), _dt.timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+        except (OverflowError, OSError, ValueError):
+            return str(value)
+    return str(value)
+
+
+def handle_history(args):
+    """``ctf history`` — bảng lịch sử submit từ submit_history.json.
+
+    Flag bị che mặc định (4 ký tự đầu + ***) chống lộ khi share screen;
+    ``--all`` hiện đầy đủ. Workspace chưa từng submit → EmptyState thân thiện
+    (heading UPPERCASE faint + dòng ``·`` muted), KHÔNG lỗi.
+    ``--clear``: xoá sạch lịch sử.
+    ``--prune <target>``: xoá các entry khớp challenge id/tên/flag.
+    """
+    if not os.path.isdir(args.workspace):
+        Logger.error(f"Workspace không tồn tại: {args.workspace}")
+        sys.exit(1)
+    repo = WorkspaceRepo(args.workspace)
+
+    # 1. Handle --clear
+    if getattr(args, 'clear', False):
+        count = repo.clear_submit_history()
+        Logger.success(f"Đã xoá {count} entry khỏi lịch sử submit.")
+        return
+
+    # 2. Handle --prune
+    prune_target = getattr(args, 'prune', None)
+    if prune_target:
+        prune_str = str(prune_target).strip()
+
+        # Dựng index tìm challenge ID / name nếu có
+        try:
+            chall_index = repo.challenge_index()
+            chall_match = repo.find_challenge(prune_str, chall_index)
+            matched_cid = str(chall_match.get('id')) if chall_match and 'id' in chall_match else None
+        except Exception:
+            matched_cid = None
+
+        def _is_match(e: dict) -> bool:
+            cid = str(e.get('challenge_id') or '')
+            flag = str(e.get('flag') or '').strip()
+            if prune_str == cid or (matched_cid and cid == matched_cid):
+                return True
+            # Destructive history cleanup must be exact.  Substring
+            # matching made short inputs such as ``FLAG`` delete unrelated
+            # submissions silently.
+            if prune_str == flag:
+                return True
+            return False
+
+        count = repo.prune_submit_history(_is_match)
+        Logger.success(f"Đã xoá {count} entry khớp '{prune_str}' khỏi lịch sử submit.")
+        return
+
+    entries = repo.load_submit_history().get('entries') or []
+    _emit_section_heading("LỊCH SỬ SUBMIT")
+    if not entries:
+        # Path/filename thật mới được màu info literal (quy tắc palette §3).
+        ws_path = os.path.abspath(args.workspace)
+        _emit_empty_state(
+            "Chưa có lịch sử submit trong workspace ",
+            literal=ws_path,
+            tail=" — submit_history.json chưa tồn tại.",
+        )
+        return
+
+    show_all = bool(getattr(args, 'show_all', False))
+    # PERF HS-B: render rich tốn O(rows) (~0.4s / 2000 rows) — mặc định chỉ
+    # in N entry MỚI NHẤT (--tail/--limit, default 100); --all hoặc tail<=0
+    # in hết. Namespace dựng thủ công thiếu attr ``tail`` giữ hành vi cũ.
+    tail = getattr(args, 'tail', None)
+    visible = entries
+    if not show_all and isinstance(tail, int) and tail > 0:
+        visible = entries[-tail:]
+    rows = []
+    # C6-02: entry thiếu challenge_id KHÔNG được đưa vào find_challenge —
+    # cid=None rơi xuống tier substring ("none" in name) và gán nhầm tên
+    # challenge nào đó chứa "none" cho một submit vô danh.
+    # PERF HS-A: index snapshot ĐÚNG MỘT LẦN trước vòng lặp — find_challenge
+    # tra trên bộ nhớ thay vì rescan toàn bộ workspace mỗi distinct cid
+    # (~90k JSON parse / 2000 entry, >2s). Index fail -> None = fallback
+    # đường snapshot-per-call cũ (đúng, chỉ chậm).
+    try:
+        chall_index = repo.challenge_index()
+    except Exception:
+        chall_index = None
+    chall_cache = {}
+    for e in visible:
+        cid = e.get('challenge_id')
+        if cid is None:
+            chall = None
+        else:
+            key = str(cid)
+            if key not in chall_cache:
+                try:
+                    chall_cache[key] = repo.find_challenge(cid, chall_index)
+                except Exception:
+                    chall_cache[key] = None
+            chall = chall_cache[key]
+        name = (chall or {}).get('name') or str(cid if cid is not None else '?')
+        icon = _HISTORY_RESULT_ICONS.get(e.get('result'), '❓')
+        flag = str(e.get('flag', '') or '')
+        shown = flag if show_all else _redact_flag(flag)
+        rows.append([_format_history_ts(e.get('timestamp')), str(name),
+                     f"{icon} {e.get('result') or 'unknown'}", shown])
+    Logger.print_table('Lịch sử submit',
+                       ['Thời gian (UTC)', 'Challenge', 'Kết quả', 'Flag'],
+                       rows)
+    if not show_all:
+        Logger.info('(Flag đang bị che — dùng --all để hiện đầy đủ.)')
+
+
+def handle_sniper(args):
+    """``ctf sniper`` — preload flag, nộp tự động đúng giờ G (P2-6).
+
+    Handler mỏng: dựng SubmitService (tự resolve URL từ workspace) +
+    SniperService rồi gọi run(). Cảnh báo automation do service tự in;
+    Ctrl-C được service bắt sạch (in target còn lại) — đây chỉ là lớp chặn
+    phòng thủ với exit code 130.
+    """
+    from .services.sniper_service import SniperService
+    from .services.submit_service import SubmitService
+
+    try:
+        cookie_val, token_val = get_auth_for_workspace(args.workspace)
+        submitter = SubmitService(cookie=cookie_val, token=token_val,
+                                  workspace_dir=args.workspace)
+    except Exception as e:
+        Logger.error(f'Khởi tạo thất bại: {e}')
+        sys.exit(1)
+
+    svc = SniperService(WorkspaceRepo(args.workspace), submitter)
+    try:
+        svc.run(poll_interval=float(getattr(args, 'poll', 10) or 10),
+                start_at=getattr(args, 'start_at', None),
+                retry_wrong=bool(getattr(args, 'retry_wrong', False)))
+    except KeyboardInterrupt:
+        Logger.info('👋 Sniper dừng — target còn lại vẫn giữ trong sniper.json.')
+        sys.exit(130)
+
+
+def handle_serve(args):
+    """``ctf serve`` — dashboard web read-only (P2-4).
+
+    Mặc định bind 127.0.0.1 (KHÔNG expose LAN); Ctrl-C tắt server sạch
+    (WebDashboard.serve tự xử lý). Port bận → OSError → exit 1.
+    """
+    if not os.path.isdir(args.workspace):
+        Logger.error(f"Workspace không tồn tại: {args.workspace}")
+        sys.exit(1)
+    from .services.web_dashboard import WebDashboard
+
+    port = int(getattr(args, 'port', WebDashboard.DEFAULT_PORT))
+    Logger.info(f'🌐 Dashboard sẵn sàng — mở http://127.0.0.1:{port}/ '
+                f'trong trình duyệt.')
+    try:
+        WebDashboard(WorkspaceRepo(args.workspace)).serve(port=port)
+    except OSError as e:
+        Logger.error(str(e))
+        sys.exit(1)
+    except KeyboardInterrupt:
+        pass
+    Logger.info('👋 Dashboard đã tắt.')
+
+
+def _prompt_yes_no(question: str) -> bool:
+    """Hỏi y/N trên tty — chỉ trả True khi user gõ y/yes.
+
+    Non-tty luôn trả False (không bao giờ tự xác nhận thao tác phá dữ liệu).
+    Dùng ``sys.stdin.readline`` thay vì ``input()`` để tuân thủ rule Phase 7:
+    tầng CLI cấm gọi input()/Prompt.ask/Confirm.ask (AST check).
+    """
+    if not sys.stdin.isatty():
+        return False
+    try:
+        console.print(f"{question} ", end="")
+        console.print("[bold]y/N[/bold]", end=" ")
+        answer = sys.stdin.readline()
+    except Exception:
+        return False
+    return answer.strip().lower() in ('y', 'yes')
+
+
+def handle_git(args):
+    """Git lifecycle: init/status/checkpoint+push/finish contest branch."""
+    from .services.git_workflow import GitWorkflowError, GitWorkflowService
+
+    command = getattr(args, 'git_command', None)
+    try:
+        if command == 'init':
+            result = GitWorkflowService.initialize_repository(
+                args.dir,
+                remote_url=getattr(args, 'remote_url', None),
+                base_branch=getattr(args, 'base', 'main') or 'main',
+                remote=getattr(args, 'remote', 'origin') or 'origin',
+                push=not getattr(args, 'no_push', False),
+                import_existing=bool(getattr(args, 'import_existing', False)),
+            )
+            Logger.success(
+                f"Git repo sẵn sàng: {result['repo_root']} "
+                f"(base={result['base_branch']})"
+            )
+            if result.get('pushed'):
+                Logger.success(
+                    f"Đã push {result['base_branch']} lên {result['remote']}."
+                )
+            elif getattr(args, 'remote_url', None):
+                Logger.warning("Repo đã init nhưng base branch chưa được push.")
+            return
+
+        if command == 'status':
+            result = GitWorkflowService.status(args.workspace)
+            rows = [
+                ["workspace", result.get("workspace") or args.workspace],
+                ["branch", result.get("branch") or "-"],
+                ["current", result.get("current_branch") or "-"],
+                ["base", result.get("base_branch") or "main"],
+                ["state", result.get("status") or "active"],
+                ["dirty", str(result.get("dirty_files", 0))],
+                ["merged", "yes" if result.get("merged_into_base") else "no"],
+                ["remote", "yes" if result.get("remote_configured") else "no"],
+            ]
+            Logger.print_table("Git Workspace", ["Field", "Value"], rows)
+            return
+
+        if command == 'push':
+            pack = not getattr(args, 'no_pack', False)
+            threshold = int(getattr(args, 'threshold', 50) or 50)
+            result = GitWorkflowService.checkpoint_and_push(
+                args.workspace,
+                message=getattr(args, 'message', None),
+                push=not getattr(args, 'no_push', False),
+                pack_challenges=pack,
+                threshold_mb=threshold,
+            )
+            rep = result.get('pack_report')
+            if rep:
+                from .services.storage_manager import human_size
+                if rep.get('compressed_count', 0) > 0:
+                    Logger.success(
+                        f"Đã nén tối ưu {rep['compressed_count']} file đề bài "
+                        f"(tiết kiệm {human_size(rep['saved_bytes'])}, {rep['saved_ratio_percent']:.1f}%)."
+                    )
+                if rep.get('skipped_count', 0) > 0:
+                    Logger.warning(
+                        f"Đã bỏ qua {rep['skipped_count']} file vượt ngưỡng {threshold}MB "
+                        "(đã thêm vào .gitignore và lưu metadata .skipped.json)."
+                    )
+            if result.get('committed'):
+                Logger.success(f"Đã checkpoint branch {result['branch']}.")
+            else:
+                Logger.info("Không có thay đổi mới cần commit.")
+            if result.get('pushed'):
+                Logger.success(
+                    f"Đã push {result['branch']} lên {result['remote']}."
+                )
+            elif not getattr(args, 'no_push', False):
+                Logger.warning(
+                    "Không có remote được cấu hình; checkpoint chỉ lưu local."
+                )
+            return
+
+        if command in ('pack', 'compress'):
+            handle_pack(args)
+            return
+
+        if command in ('unpack', 'decompress'):
+            handle_unpack(args)
+            return
+
+        if command in ('finish', 'end', 'merge'):
+            result = GitWorkflowService.finish(
+                args.workspace,
+                base_branch=getattr(args, 'base', None),
+                remote=getattr(args, 'remote', None),
+                push=not getattr(args, 'no_push', False),
+                delete_remote=not getattr(args, 'keep_remote', False),
+            )
+            Logger.success(
+                f"Đã merge {result['branch']} → {result['base_branch']}."
+            )
+            if result.get('base_pushed'):
+                Logger.success(f"Đã push {result['base_branch']} lên remote.")
+            if result.get('remote_deleted'):
+                Logger.success(f"Đã xóa remote branch {result['branch']}.")
+            if result.get('local_deleted'):
+                Logger.success(f"Đã xóa local branch {result['branch']}.")
+            return
+
+        Logger.error("Thiếu Git subcommand: init | status | push | pack | unpack | finish")
+        sys.exit(2)
+    except GitWorkflowError as exc:
+        Logger.error(str(exc))
+        sys.exit(1)
+
+
+def handle_pack(args):
+    """Nén tối đa các file đề bài trong workspace (XZ extreme, tự động skip nếu > 50MB)."""
+    from .services.challenge_compressor import ChallengeCompressor
+    from .services.storage_manager import human_size
+    from rich.table import Table
+    from rich.panel import Panel
+    from rich.text import Text
+    from rich import box
+    from .ui.theme import ACCENT, ACCENT_DEEP, FG_BASE, FG_MUTED, SUCCESS, WARN, load_theme
+
+    ws = Path(getattr(args, 'workspace', '.') or '.').expanduser().resolve()
+    threshold = int(getattr(args, 'threshold', 50) or 50)
+    pack_all = bool(getattr(args, 'all', False))
+    replace_orig = not bool(getattr(args, 'keep_original', False))
+
+    con = Console(theme=load_theme(None))
+    con.print()
+    header = Text()
+    header.append("◈ ", style=f"bold {ACCENT}")
+    header.append("CHALLENGE PACKER · NÉN ĐỀ BÀI TỐI ƯU CHO GIT", style=f"bold {FG_BASE}")
+    header.append(f" (Ngưỡng: {threshold}MB)", style=FG_MUTED)
+    con.print(Panel(header, box=box.ROUNDED, border_style=ACCENT_DEEP, padding=(0, 1)))
+
+    with con.status(f"[bold {ACCENT}]Đang quét và nén các file đề bài trong {ws.name}...[/bold {ACCENT}]"):
+        rep = ChallengeCompressor.pack_workspace(
+            ws,
+            threshold_mb=threshold,
+            pack_all=pack_all,
+            replace_original=replace_orig,
+        )
+
+    tbl = Table(box=box.ROUNDED, border_style=ACCENT_DEEP, show_header=True, header_style=f"bold {ACCENT}")
+    tbl.add_column("Mục tiêu", style=f"bold {FG_BASE}")
+    tbl.add_column("Thao tác", style=f"bold {SUCCESS}")
+    tbl.add_column("Gốc", justify="right", style=FG_MUTED)
+    tbl.add_column("Sau nén", justify="right", style=f"bold {ACCENT}")
+    tbl.add_column("Tỷ lệ", justify="right", style=f"bold {SUCCESS}")
+
+    for r in rep.get("results", []):
+        p_name = Path(r["original_path"]).name
+        action = r["action"]
+        orig_s = human_size(r["original_size"])
+        comp_s = human_size(r["compressed_size"]) if r.get("compressed_size") else "-"
+        ratio = f"{100 - (r['compressed_size']/r['original_size']*100):.1f}%" if r.get("compressed_size") and r["original_size"] > 0 else "-"
+
+        if action == "compressed":
+            act_text = Text("✔ Nén thành công", style=f"bold {SUCCESS}")
+        elif action == "skipped_too_large":
+            act_text = Text(f"! Bỏ qua (>{threshold}MB)", style=f"bold {WARN}")
+        elif action == "already_compressed":
+            act_text = Text("· Đã nén sẵn", style=FG_MUTED)
+        else:
+            act_text = Text(action, style=FG_MUTED)
+
+        tbl.add_row(p_name, act_text, orig_s, comp_s, ratio)
+
+    if rep.get("results"):
+        con.print(tbl)
+
+    summary_text = (
+        f"Hoàn tất: Nén {rep['compressed_count']} file | Bỏ qua {rep['skipped_count']} file (> {threshold}MB) | "
+        f"Tiết kiệm {human_size(rep['saved_bytes'])} ({rep['saved_ratio_percent']:.1f}% dung lượng)."
+    )
+    Logger.success(summary_text)
+
+
+def handle_unpack(args):
+    """Giải nén các file đề bài trong workspace để phân tích/giải bài."""
+    from .services.challenge_compressor import ChallengeCompressor
+    from rich.panel import Panel
+    from rich.text import Text
+    from rich import box
+    from .ui.theme import ACCENT, ACCENT_DEEP, FG_BASE, FG_MUTED, load_theme
+
+    ws = Path(getattr(args, 'workspace', '.') or '.').expanduser().resolve()
+    con = Console(theme=load_theme(None))
+    con.print()
+    header = Text()
+    header.append("◈ ", style=f"bold {ACCENT}")
+    header.append("CHALLENGE UNPACKER · GIẢI NÉN ĐỀ BÀI ĐỂ PHÂN TÍCH", style=f"bold {FG_BASE}")
+    con.print(Panel(header, box=box.ROUNDED, border_style=ACCENT_DEEP, padding=(0, 1)))
+
+    with con.status(f"[bold {ACCENT}]Đang giải nén các file đề bài trong {ws.name}...[/bold {ACCENT}]"):
+        rep = ChallengeCompressor.unpack_workspace(ws)
+
+    Logger.success(f"Đã giải nén thành công {rep['unpacked_count']} file đề bài.")
+    if rep.get("error_count", 0) > 0:
+        Logger.warning(f"Có {rep['error_count']} file gặp lỗi khi giải nén: {rep.get('errors')}")
+
+
+def handle_storage(args):
+    """``ctf storage`` (alias du/archive) — báo cáo dung lượng + archive.
+
+    - Không subcommand: scan_usage + format_report (+ suggest_actions khi có
+      gợi ý thực sự, bỏ qua dòng ✅ all-good).
+    - Subcommand ``archive <workspace_name>``: confirm (hoặc --yes), gọi
+      StorageManager.archive_workspace, in ratio, rồi HỎI RIÊNG việc xoá
+      workspace gốc — chỉ xoá khi user gõ yes (delete là rename an toàn).
+    """
+    from .services.storage_manager import StorageManager, human_size
+
+    if getattr(args, 'storage_command', None) == 'archive':
+        _handle_storage_archive(args, StorageManager, human_size)
+        return
+
+    usages = StorageManager.scan_usage(args.base_dir)
+    # format_report trả markup rich-ready (glyph ngưỡng !/✗ ở cột NOTE, nhãn
+    # faint) — in qua rich console để resolve, không print() thô.
+    # soft_wrap=True: bảng rộng không bị ngắt dòng giữa các cột ở terminal
+    # hẹp (giữ hành vi print() cũ).
+    # highlight=False: tắt ReprHighlighter của rich — không tô cyan tự do
+    # lên các con số trong bảng (palette §3: số liệu neutral).
+    console.print(
+        StorageManager.format_report(usages, threshold_mb=args.threshold_mb),
+        soft_wrap=True, highlight=False)
+
+    suggestions = StorageManager.suggest_actions(
+        args.base_dir, threshold_mb=args.threshold_mb
+    )
+    meaningful = [s for s in suggestions if not s.startswith('✔')]
+    if meaningful:
+        _render_suggestions(meaningful)
+
+
+def _render_suggestions(items):
+    """Gợi ý storage dạng list PHOSPHOR: heading UPPERCASE faint, glyph
+    semantic (! warn / ℹ info) màu đúng luật, continuation line wrap với
+    indent 2 spaces (không treo dòng ở cột 0)."""
+    width = getattr(console, 'width', None) or 80
+    # Khoảng thở kép trước block GỢI Ý — tách biệt rõ hơn khỏi bảng
+    # (codex-r2 P1: bảng dài khá phẳng, tăng hierarchy block gợi ý).
+    console.print()
+    console.print()
+    console.print(Text('GỢI Ý', style=_FAINT_COLOR))
+    for s in items:
+        glyph, gstyle, body = '', '', s
+        if s.startswith('! '):
+            glyph, gstyle, body = '!', _WARN_COLOR, s[2:]
+        elif s.startswith('ℹ '):
+            glyph, gstyle, body = 'ℹ', _INFO_COLOR, s[2:]
+        chunks = textwrap.wrap(
+            body, width=max(40, int(width) - 4),
+            break_on_hyphens=False) or [body]
+        line = Text()
+        if glyph:
+            line.append(glyph + ' ', style=gstyle)
+        else:
+            line.append('- ', style=_MUTED_COLOR)
+        line.append(chunks[0])
+        console.print(line)
+        for chunk in chunks[1:]:
+            console.print(Text('  ' + chunk))
+
+
+def _handle_storage_archive(args, StorageManager, human_size):
+    base_dir = os.path.expanduser(args.base_dir)
+    ws_path = os.path.join(base_dir, args.workspace_name)
+
+    if not os.path.isdir(ws_path):
+        Logger.error(f"Workspace không tồn tại: {ws_path}")
+        sys.exit(1)
+
+    # Confirm 1: archive. Non-tty không --yes → exit 2 (bắt buộc --yes).
+    if not args.yes:
+        if not sys.stdin.isatty():
+            Logger.error(
+                'Chạy non-interactive: cần --yes để xác nhận archive '
+                '(không bao giờ tự xác nhận).'
+            )
+            sys.exit(2)
+        if not _prompt_yes_no(
+                f"Xác nhận archive workspace '{args.workspace_name}'?"):
+            Logger.info('Đã huỷ — không archive.')
+            return
+
+    try:
+        result = StorageManager.archive_workspace(
+            ws_path,
+            out_dir=args.out,
+            git_remote=args.git_remote,
+        )
+    except Exception as exc:
+        Logger.error(f'Archive thất bại: {exc}')
+        sys.exit(1)
+
+    Logger.success(
+        f"Đã archive → {result['archive_path']} "
+        f"({human_size(result['original_bytes'])} → "
+        f"{human_size(result['archived_bytes'])}, "
+        f"ratio {result['ratio']:.2%})"
+    )
+
+    # Confirm 2 (riêng biệt): xoá workspace gốc — CHỈ khi user gõ yes.
+    # Non-tty → skip hoàn toàn (dữ liệu giữ nguyên).
+    if _prompt_yes_no(
+            f"Xoá workspace gốc '{args.workspace_name}'? "
+            f"(rename an toàn vào _archives)"):
+        trash = StorageManager.delete_workspace(ws_path)
+        Logger.success(f"Đã chuyển workspace vào thùng rác: {trash}")
+    else:
+        Logger.info('Giữ nguyên workspace gốc.')
+
+
+# ----------------------------------------------------------------------
+# CONFIG — xem/đặt cấu hình toàn cục (spec event-window §4)
+# ----------------------------------------------------------------------
+
+#: Registry các key config toàn cục điều khiển được từ ``ctf config``.
+#: ``path`` = vị trí lưu trong global config JSON (~/.config/ctf_toolkit/
+#: config.json); ``values`` = bảng giá trị CLI hợp lệ -> giá trị lưu.
+#: Spec event-window §4 ("Đổi ý: ctf config auto-sync off"). Precedence
+#: (R6): giá trị toàn cục là MẶC ĐỊNH; ``.ctf/config.json`` của workspace
+#: là OVERRIDE — watch_service đọc hai tầng qua resolve_auto_sync_enabled.
+def _normalize_workspace_root(value: str) -> str:
+    raw = str(value or '').strip()
+    if not raw:
+        raise ValueError('đường dẫn không được để trống')
+    return os.path.abspath(os.path.expanduser(raw))
+
+
+from .ui.palettes import PRESET_PALETTES
+
+_CONFIG_KEYS = {
+    'auto-sync': {
+        'path': ('auto_sync', 'enabled'),
+        'values': {'on': True, 'off': False},
+        'default': True,
+        'desc': ('Tự động cập nhật challenge/scoreboard/notices '
+                 '(ctf watch) — mặc định toàn cục, workspace '
+                 '.ctf/config.json override'),
+    },
+    'workspace-root': {
+        'path': ('workspace_root',),
+        'normalize': _normalize_workspace_root,
+        'default': os.path.expanduser('~/Workspace/CTF'),
+        'desc': 'Thư mục gốc mặc định để pull/scan/storage/git lưu các giải',
+    },
+    'theme': {
+        'path': ('theme',),
+        'values': {k: k for k in PRESET_PALETTES.keys()},
+        'default': 'exodia',
+        'desc': f"Visual theme palette ({', '.join(sorted(set(p.name for p in PRESET_PALETTES.values())))})",
+    },
+}
+
+
+def _config_render(spec, stored):
+    """Giá trị lưu trong JSON -> chuỗi hiển thị CLI."""
+    for name, val in spec.get('values', {}).items():
+        if val == stored:
+            return name
+    return str(stored)
+
+
+def handle_config(args):
+    """``ctf config`` — xem/đặt cấu hình toàn cục.
+
+    - Không đối số: liệt kê mọi key biết được + giá trị hiện tại.
+    - ``ctf config <key>``: xem giá trị hiện tại của một key.
+    - ``ctf config <key> <value>``: đặt giá trị mới + persist global config.
+    Exit code: 0 thành công | 1 lỗi ghi | 2 key lạ hoặc giá trị lạ.
+    """
+    from .storage.global_config import (
+        GLOBAL_CONFIG_FILE, load_global_config, update_global_config,
+    )
+
+    key = getattr(args, 'key', None)
+    value = getattr(args, 'value', None)
+
+    if key is not None and key not in _CONFIG_KEYS:
+        Logger.error(f"Key không hỗ trợ: '{key}'. Các key biết được: "
+                     f"{', '.join(sorted(_CONFIG_KEYS))}.")
+        sys.exit(2)
+
+    spec = _CONFIG_KEYS.get(key)          # None khi liệt kê (không có key)
+    new_val = None
+    if value is not None:
+        if 'values' in spec:
+            normalized = value.strip().lower()
+            if normalized not in spec['values']:
+                Logger.error(f"Giá trị không hợp lệ cho '{key}': '{value}' "
+                             f"(nhận: {'|'.join(spec['values'])}).")
+                sys.exit(2)
+            new_val = spec['values'][normalized]
+        else:
+            try:
+                new_val = spec['normalize'](value)
+            except (TypeError, ValueError) as exc:
+                Logger.error(f"Giá trị không hợp lệ cho '{key}': {exc}.")
+                sys.exit(2)
+
+    cfg = load_global_config()
+
+    if value is None:                                   # chế độ XEM
+        shown = sorted(_CONFIG_KEYS.items()) if key is None else [(key, spec)]
+        # Renderer PHOSPHOR thay Logger `[*]` legacy (synthesis-v6 MF3):
+        # heading faint + path literal neutral; hàng key wrap qua
+        # _emit_wrapped — continuation thụt đúng cột giá trị (cột 15,
+        # sau ``{name:<12} = ``), không bao giờ gãy về cột 1.
+        _emit_section_heading("CẤU HÌNH TOÀN CỤC")
+        _emit_wrapped([("· file ", _MUTED_COLOR),
+                       (GLOBAL_CONFIG_FILE, _INFO_COLOR)])
+        for name, kspec in shown:
+            node, found = cfg, True
+            for part in kspec['path']:
+                if isinstance(node, dict) and part in node:
+                    node = node[part]
+                else:
+                    found = False
+                    break
+            current = node if found else kspec['default']
+            rendered = _config_render(kspec, current)
+            suffix = '' if found else ' (mặc định)'
+            segments = [
+                (f"{name:<12}", "fg.base"),
+                ("=", _FAINT_COLOR),
+                (rendered, "fg.base"),
+            ]
+            if suffix:
+                segments.append((suffix, _FAINT_COLOR))
+            segments.append((f"— {kspec['desc']}", _MUTED_COLOR))
+            _emit_wrapped(segments, indent=" " * 15)
+        return
+
+    # Chế độ ĐẶT: đọc-mutate-ghi TRONG CÙNG khóa flock qua
+    # update_global_config (review c18-2, MED) — ghi đúng path của key trên
+    # state HIỆN HÀNH trên đĩa, giữ nguyên mọi dữ liệu khác
+    # (workspaces/auth/register_state…) kể cả những gì tiến trình khác vừa
+    # ghi giữa chừng. Code cũ load-stale-save tin dùng snapshot đầu phiên:
+    # lần ĐẶT đè mất register_state/auth do tiến trình khác ghi trong lúc
+    # này. Mutator chỉ mutate dict hiện hành, không giữ reference cũ.
+
+    def _set_key(state):
+        node = state
+        for part in spec['path'][:-1]:
+            child = node.get(part) if isinstance(node, dict) else None
+            if not isinstance(child, dict):
+                child = {}
+                node[part] = child
+            node = child
+        node[spec['path'][-1]] = new_val
+        return state
+
+    try:
+        saved_state = update_global_config(_set_key)
+    except OSError as exc:
+        # Lỗi persist không được nuốt im lặng rồi báo success — exit code
+        # phải phản ánh đúng thất bại.
+        Logger.error(f"Không ghi được global config "
+                     f"({GLOBAL_CONFIG_FILE}): {exc}")
+        sys.exit(1)
+    if saved_state is None:
+        # Review 536364d (LOW): _set_key luôn trả state nên None chỉ có thể
+        # là thư mục global config biến mất giữa chừng (locked_update_json
+        # không hồi sinh dir). Không persist gì thì KHÔNG được báo success:
+        # warning rõ + exit 1 như nhánh OSError (pattern register c18-2).
+        Logger.warning(f"Không ghi được global config ({GLOBAL_CONFIG_FILE}): "
+                       f"thư mục chứa file đã biến mất — cấu hình mới "
+                       f"không được persist.")
+        sys.exit(1)
+    Logger.success(f"Đã lưu {key} = {_config_render(spec, new_val)} "
+                   f"({GLOBAL_CONFIG_FILE}).")
+
+
+def handle_bridge(args):
+    """Manage local Browser Extension Bridge daemon and authentication token."""
+    from .bridge.daemon import BridgeDaemon
+    from .ui.theme import ACCENT, FG_MUTED, INFO, SOLVED, WARN
+
+    action = getattr(args, "bridge_action", "status") or "status"
+    daemon = BridgeDaemon()
+
+    if action == "start":
+        daemon_status = daemon.inspect_status()
+        if daemon_status["owned"]:
+            Logger.info(
+                f"Bridge daemon đã đang chạy tại "
+                f"ws://{daemon.host}:{daemon.port}/ws "
+                f"(PID: {daemon_status['pid']})."
+            )
+            return
+        if daemon_status["port_conflict"]:
+            Logger.error(
+                f"Port {daemon.host}:{daemon.port} bị process khác chiếm."
+            )
+            Logger.info("Action: dừng process đó hoặc đổi port Bridge.")
+            sys.exit(1)
+        try:
+            daemon.get_or_create_token()
+        except Exception as exc:
+            Logger.error(f"Không chuẩn bị được Bridge token: {exc}")
+            sys.exit(1)
+        ok = daemon.ensure_running()
+        if ok:
+            Logger.success(f"Đã khởi chạy Bridge daemon tại ws://{daemon.host}:{daemon.port}/ws (PID: {daemon.read_pid()}).")
+        else:
+            detail = daemon.last_error or "không có chi tiết"
+            Logger.error(f"Không thể khởi chạy Bridge daemon: {detail}")
+            sys.exit(1)
+
+    elif action == "stop":
+        if not daemon.is_running():
+            Logger.info("Bridge daemon hiện không chạy.")
+            return
+        daemon.stop()
+        Logger.success("Đã dừng Bridge daemon.")
+
+    elif action == "token":
+        try:
+            token = daemon.get_or_create_token()
+        except Exception as exc:
+            Logger.error(f"Không đọc/tạo được Bridge token: {exc}")
+            sys.exit(1)
+        print(token)
+
+    else:  # status
+        from .services.health_service import HealthService
+
+        info = HealthService.check_bridge_health()
+        state = str(info.get("state") or "unknown")
+        state_style = SOLVED if state == "ready" else WARN
+        state_label = {
+            "ready": "READY",
+            "daemon-only": "DAEMON ONLY",
+            "degraded": "DEGRADED",
+            "port-conflict": "PORT CONFLICT",
+            "runtime-unavailable": "RUNTIME ERROR",
+            "token-unavailable": "TOKEN ERROR",
+            "stopped": "STOPPED",
+        }.get(state, state.upper())
+
+        Logger.info(
+            f"BROWSER BRIDGE // [bold {state_style}]{state_label}[/bold {state_style}]",
+            markup=True,
+        )
+        Logger.info(f"  Host / Port : {daemon.host}:{daemon.port}")
+        Logger.info(f"  Daemon PID  : {info.get('pid') or '-'}")
+        if info.get("port_conflict"):
+            port_state = "foreign listener"
+        elif info.get("port_open"):
+            port_state = "listening"
+        else:
+            port_state = "closed"
+        Logger.info(f"  Port State  : {port_state}")
+        Logger.info(
+            "  Extension   : "
+            + ("connected" if info.get("extension_connected") else "not connected")
+        )
+        Logger.info(
+            "  Token File  : "
+            + ("present" if info.get("token_exists") else "missing")
+        )
+
+        if info.get("error") and state != "port-conflict":
+            Logger.warning(f"Bridge probe: {info['error']}")
+        if state == "runtime-unavailable":
+            Logger.info(
+                "  Action      : chạy 'python -m pip install -r requirements.txt'"
+            )
+        elif state == "port-conflict":
+            Logger.info(
+                "  Action      : dừng process chiếm port / đổi port"
+            )
+        elif state == "stopped":
+            Logger.info("  Action      : chạy 'ctf bridge start'")
+        elif state in {"daemon-only", "degraded"}:
+            Logger.info(
+                "  Action      : mở browser có CTF Bridge Extension và kiểm tra token"
+            )
+        elif state == "token-unavailable":
+            Logger.info(
+                "  Action      : kiểm tra quyền token file hoặc chạy 'ctf bridge token'"
+            )
+
+
+def handle_platform(args):
+    """Quản lý các platform schema và chạy auto-recon khám phá nền tảng mới."""
+    action = getattr(args, "platform_action", None) or "list"
+    ws = getattr(args, "workspace", None)
+
+    from rich.console import Console
+    from rich.table import Table
+    from rich.syntax import Syntax
+    from rich.panel import Panel
+    from .ui.theme import load_theme, FG_BASE, FG_MUTED, FG_FAINT, ACCENT, INFO, SOLVED, WARN
+    from .platforms.schema_store import PlatformSchemaStore
+    from .platforms.schema import PlatformSchema
+    from .platforms.recon import PlatformReconEngine
+    from .platforms.registry import PLATFORMS
+
+    con = Console(theme=load_theme(None))
+
+    if action == "list":
+        PlatformSchemaStore.sync_to_registry(workspace_path=ws)
+        schemas = PlatformSchemaStore.load_all(workspace_path=ws)
+
+        table = Table(
+            title="REGISTERED CTF PLATFORMS & SCHEMAS",
+            title_style=f"bold {ACCENT}",
+            show_header=True,
+            header_style=f"bold {FG_MUTED}",
+            expand=True,
+        )
+        table.add_column("KEY", style=f"bold {ACCENT}", no_wrap=True)
+        table.add_column("LABEL", style=f"{FG_BASE}")
+        table.add_column("SOURCE", style=f"{INFO}")
+        table.add_column("THROTTLE", justify="right", style=f"{FG_MUTED}")
+        table.add_column("ENDPOINTS / CAPABILITIES", style=f"{FG_MUTED}")
+
+        for key, spec in sorted(PLATFORMS.items()):
+            source = "built-in adapter"
+            schema = schemas.get(key)
+            if schema:
+                source = f"{schema.source} schema"
+            elif getattr(spec, "source", None) == "custom_schema":
+                source = "custom schema"
+
+            endpoints_summary = []
+            if schema:
+                if schema.endpoints.challenges:
+                    endpoints_summary.append("challenges")
+                if schema.endpoints.auth_check:
+                    endpoints_summary.append("auth")
+                if schema.endpoints.submit:
+                    endpoints_summary.append("submit")
+                if schema.endpoints.scoreboard:
+                    endpoints_summary.append("scoreboard")
+            else:
+                if spec.supports_container:
+                    endpoints_summary.append("container")
+                if spec.supports_scoreboard:
+                    endpoints_summary.append("scoreboard")
+                if spec.probes:
+                    endpoints_summary.append(f"{len(spec.probes)} probes")
+
+            ep_str = ", ".join(endpoints_summary) if endpoints_summary else "standard"
+            table.add_row(
+                key,
+                spec.label,
+                source,
+                f"{spec.throttle:.1f}s",
+                ep_str,
+            )
+
+        con.print()
+        con.print(table)
+        con.print()
+
+    elif action == "show":
+        key = (getattr(args, "target", "") or "").strip().lower()
+        if not key:
+            Logger.error("Thiếu platform key. Ví dụ: ctf platform show metactf")
+            sys.exit(1)
+
+        schema = PlatformSchemaStore.get(key, workspace_path=ws)
+        if not schema:
+            if key in PLATFORMS:
+                spec = PLATFORMS[key]
+                con.print(Panel(
+                    f"[bold {FG_BASE}]{spec.label}[/bold {FG_BASE}] ({key})\n"
+                    f"Loại: [bold {INFO}]Built-in Python Adapter[/bold {INFO}]\n"
+                    f"Class: [bold {INFO}]{spec.cls.__module__}.{spec.cls.__name__}[/bold {INFO}]\n"
+                    f"Throttle: {spec.throttle}s\n"
+                    f"Markers: {', '.join(spec.html_markers) or 'none'}\n"
+                    f"Cookie hints: {', '.join(spec.cookie_hints) or 'none'}\n"
+                    f"Container: {'Có' if spec.supports_container else 'Không'}\n"
+                    f"Scoreboard: {'Có' if spec.supports_scoreboard else 'Không'}",
+                    title=f"Platform: {key}",
+                    border_style=ACCENT,
+                ))
+                return
+            Logger.error(f"Không tìm thấy platform schema cho key '{key}'")
+            sys.exit(1)
+
+        con.print(Panel(
+            Syntax(schema.to_json(indent=2), "json", theme="monokai", line_numbers=True),
+            title=f"Platform Schema: [bold {ACCENT}]{schema.label}[/bold {ACCENT}] ({schema.key})",
+            subtitle=f"Source: {schema.source}",
+            border_style=ACCENT,
+        ))
+
+    elif action == "probe":
+        url = (getattr(args, "url", "") or "").strip()
+        if not url:
+            Logger.error("Thiếu target URL để probe. Ví dụ: ctf platform probe https://ctf.example.com")
+            sys.exit(1)
+
+        Logger.info(f"Đang tiến hành Auto-Recon trên: [info]{url}[/info]", markup=True)
+        res = PlatformReconEngine.probe_url(
+            url,
+            custom_key=getattr(args, "key", None),
+            custom_label=getattr(args, "label", None),
+        )
+
+        res_table = Table(title="AUTO-RECON FINDINGS", title_style=f"bold {ACCENT}", expand=True)
+        res_table.add_column("PROPERTY", style=f"bold {FG_MUTED}")
+        res_table.add_column("VALUE", style=f"{FG_BASE}")
+
+        res_table.add_row("Target URL", escape(res.url))
+        res_table.add_row("Detected Title", escape(res.detected_title or "(none)"))
+        conf_style = _SOLVED_COLOR if res.confidence == "high" else (_WARN_COLOR if res.confidence == "medium" else _MUTED_COLOR)
+        res_table.add_row("Confidence", f"[{conf_style}]{escape(res.confidence.upper())}[/{conf_style}]")
+        res_table.add_row("Endpoints Found", escape(", ".join(f"{k} -> {v}" for k, v in res.endpoints_found.items()) or "(none)"))
+        res_table.add_row("HTML Markers", escape(", ".join(res.html_markers) or "(none)"))
+        res_table.add_row("Cookie Hints", escape(", ".join(res.cookie_hints) or "(none)"))
+
+        con.print()
+        con.print(res_table)
+        con.print()
+
+        if res.candidate_schema:
+            con.print(Panel(
+                Syntax(res.candidate_schema.to_json(indent=2), "json", theme="monokai", line_numbers=True),
+                title=f"Candidate Platform Schema ([bold {ACCENT}]{res.candidate_schema.key}[/bold {ACCENT}])",
+                border_style=ACCENT,
+            ))
+
+            if getattr(args, "save", False):
+                scope = getattr(args, "scope", "global")
+                saved_p = PlatformReconEngine.save_recon_schema(
+                    res.candidate_schema,
+                    scope=scope,
+                    workspace_path=ws,
+                )
+                Logger.success(f"Đã lưu candidate schema vào {saved_p} ({scope} scope).")
+            else:
+                Logger.info("Gợi ý: Thêm cờ [accent]--save[/accent] để tự động lưu schema vào kho cấu trúc platform.", markup=True)
+        else:
+            Logger.warning("Không tìm thấy đủ API endpoints để tự động suy luận platform schema.")
+
+    elif action == "add":
+        target = (getattr(args, "target", "") or "").strip()
+        if not target:
+            Logger.error("Thiếu đường dẫn file JSON hoặc nội dung schema JSON.")
+            sys.exit(1)
+
+        raw_json = ""
+        p = Path(target)
+        if p.is_file():
+            raw_json = p.read_text(encoding="utf-8")
+        else:
+            raw_json = target
+
+        try:
+            schema = PlatformSchema.from_json(raw_json)
+        except Exception as e:
+            Logger.error(f"JSON không hợp lệ cho platform schema: {e}")
+            sys.exit(1)
+
+        scope = getattr(args, "scope", "global")
+        saved_p = PlatformSchemaStore.save(schema, scope=scope, workspace_path=ws)
+        PlatformSchemaStore.sync_to_registry(workspace_path=ws)
+        Logger.success(f"Đã thêm và kích hoạt platform schema '[bold {ACCENT}]{schema.key}[/bold {ACCENT}]' tại {saved_p}")
+
+    elif action in ("remove", "rm", "delete"):
+        key = (getattr(args, "target", "") or "").strip().lower()
+        if not key:
+            Logger.error("Thiếu platform key cần xoá.")
+            sys.exit(1)
+
+        scope = getattr(args, "scope", "global")
+        ok = PlatformSchemaStore.delete(key, scope=scope, workspace_path=ws)
+        if ok:
+            PlatformSchemaStore.sync_to_registry(workspace_path=ws)
+            Logger.success(f"Đã xoá platform schema '{key}' khỏi {scope} scope.")
+        else:
+            Logger.warning(f"Không tìm thấy file schema '{key}.json' trong {scope} scope.")
+
+
+def handle_auth(args):
+    """``ctf auth`` — manage, inspect, or sync credentials for workspace or platform URL."""
+    from .services.auth_service import AuthService
+    from .services.burp_service import BurpService
+    from .storage.workspace_repo import WorkspaceRepo
+
+    raw_ws = getattr(args, 'workspace', None)
+    plat_url = getattr(args, 'url', None)
+    target = raw_ws or plat_url or '.'
+    resolved_ws = None
+
+    if os.path.isdir(target):
+        resolved_ws = os.path.abspath(target)
+        if not plat_url:
+            try:
+                plat_url = WorkspaceRepo(resolved_ws).resolve_platform_url()
+            except Exception:
+                pass
+    elif not plat_url and ("://" in str(target) or "." in str(target)):
+        plat_url = str(target)
+
+    if getattr(args, 'clear', False):
+        AuthService.delete_auth(resolved_ws or target, url=plat_url)
+        Logger.success(f"Cleared authentication credentials for {resolved_ws or plat_url}.")
+        return
+
+    if getattr(args, 'from_burp', False):
+        burp_port = getattr(args, 'burp_port', 9876) or 9876
+        burp = BurpService(mcp_port=burp_port)
+        if not burp.is_mcp_available(timeout=0.6):
+            Logger.error(f"Burp Suite MCP server is not reachable on localhost:{burp_port}.")
+            sys.exit(1)
+
+        domain_target = plat_url or resolved_ws or target
+        cookies = burp.extract_cookies(domain_target, count=100, timeout=3.0)
+        if not cookies:
+            Logger.warning(f"No session cookies found for '{domain_target}' in Burp Suite HTTP history.")
+            sys.exit(1)
+
+        cookie_str = "; ".join(f"{k}={v}" for k, v in cookies.items())
+        token_val = getattr(args, 'token', None)
+        ok = AuthService.save_auth(resolved_ws or target, url=plat_url, cookie=cookie_str, token=token_val)
+        if ok:
+            Logger.success(f"Successfully synced {len(cookies)} cookies from Burp Suite for {plat_url or resolved_ws}!")
+        else:
+            Logger.error(f"Failed to persist authentication credentials for {plat_url or resolved_ws}.")
+            sys.exit(1)
+        return
+
+    cookie_in = getattr(args, 'cookie', None)
+    token_in = getattr(args, 'token', None)
+    if cookie_in or token_in:
+        ok = AuthService.save_auth(resolved_ws or target, url=plat_url, cookie=cookie_in, token=token_in)
+        if ok:
+            Logger.success(f"Saved credentials for {plat_url or resolved_ws}.")
+        else:
+            Logger.error(f"Failed to persist authentication credentials for {plat_url or resolved_ws}.")
+            sys.exit(1)
+        return
+
+    # Default / --show: display current credentials
+    c_saved, t_saved = AuthService.resolve(resolved_ws or target, allow_burp_fallback=False)
+    if not c_saved and not t_saved and plat_url and plat_url != (resolved_ws or target):
+        c_saved, t_saved = AuthService.resolve(plat_url, allow_burp_fallback=False)
+
+    target_label = resolved_ws or plat_url or target
+    Logger.info(f"Authentication credentials for {target_label}:")
+    c_disp = (c_saved[:12] + "..." + c_saved[-6:]) if (c_saved and len(c_saved) > 20) else (c_saved or "(none)")
+    t_disp = (t_saved[:8] + "...") if (t_saved and len(t_saved) > 12) else (t_saved or "(none)")
+    Logger.info(f"  Cookie: {c_disp}")
+    Logger.info(f"  Token:  {t_disp}")
+
+

@@ -1,0 +1,229 @@
+import math
+import os
+from collections import defaultdict
+from typing import List, Dict, Any
+from ..platforms.base import Challenge, CTFInfo
+from ..services.status_service import ROW_GLYPHS
+from ..storage.constants import DEFAULT_CATEGORY, SUMMARY_FILES_LINE
+from ..storage.workspace_repo import WorkspaceRepo
+from ..utils.sanitize import md_cell
+from .workspace_builder import WorkspaceBuilder
+
+
+def _safe_int(value) -> int:
+    """Ép points về int an toàn: None / chuỗi không số / kiểu lạ -> 0.
+
+    Platform thật (gzCTF/rCTF dynamic scoring) trả ``points: null`` rất phổ
+    biến — không ép sẽ crash cả pipeline download ở bước cuối.
+
+    ``OverflowError``: ``int(float('inf'))`` — Python json.loads chấp nhận
+    literal ``Infinity`` từ platform API nên đường vào là thật.
+    ``ValueError`` đã phủ ``int(float('nan'))`` và chuỗi như ``"1e400"``.
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def _points_value(value):
+    """Điểm dạng số phục vụ TỔNG/HIỂN THỊ: giữ nguyên phần lẻ (13.37) thay
+    vì cắt cụt qua ``int()`` như _safe_int. None / không-phải-số /
+    NaN/Inf -> None (caller hiển thị '-'; tổng bỏ qua)."""
+    if value is None:
+        return None
+    try:
+        num = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(num):
+        return None
+    return int(num) if num.is_integer() else num
+
+
+def _points_display(value) -> str:
+    """Cell điểm trong bảng SUMMARY: số in đúng dạng platform trả
+    (13.37 stays 13.37), thiếu điểm (None/rác) -> '-' thay vì in chữ
+    'None' ra markdown."""
+    num = _points_value(value)
+    return "-" if num is None else str(num)
+
+
+def _points_total_display(num) -> str:
+    """TỔNG điểm hiển thị trong SUMMARY (dòng Total Points Available + cột
+    Total Points của bảng category): khử artefact cộng float nhị phân —
+    ``0.1 + 0.2`` ra ``0.30000000000000004``, không được in nguyên văn.
+    round về 6 chữ số thập phân là trần an toàn cho sai số tích luỹ của
+    điểm CTF (dynamic scoring ≤ 2 số lẻ); tổng nguyên vẫn in kiểu int
+    (``100`` chứ không ``100.0``). None -> '-'."""
+    value = _points_value(num)
+    if value is None:
+        return "-"
+    rounded = round(value, 6)
+    if isinstance(rounded, float) and rounded.is_integer():
+        rounded = int(rounded)
+    return str(rounded)
+
+
+def _json_safe(obj):
+    """Đệ quy thay float NaN/Inf bằng None: json.dump mặc định allow_nan=True
+    tạo literal ``NaN``/``Infinity`` mà parser strict JSON (jq...) không đọc được."""
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    return obj
+
+
+def _safe_category(category) -> str:
+    """Category None/rỗng -> nhóm default, tránh trộn None với str khi sorted()."""
+    if category is None or not str(category).strip():
+        return DEFAULT_CATEGORY
+    return str(category)
+
+class SummaryGenerator:
+    @staticmethod
+    def generate_summary(
+        base_output_dir: str,
+        ctf_info: CTFInfo,
+        all_results: Dict[Any, List[Dict[str, Any]]]  # challenge_id -> list of download result dicts
+    ) -> str:
+        """
+        Generates SUMMARY.md and challenges.json in base_output_dir.
+        """
+        os.makedirs(base_output_dir, exist_ok=True)
+        challenges = ctf_info.challenges
+
+        # Group by category
+        by_category = defaultdict(list)
+        total_points = 0
+        total_files = 0
+        
+        for chall in challenges:
+            by_category[_safe_category(chall.category)].append(chall)
+            chall_pts = _points_value(chall.points)
+            total_points += chall_pts if chall_pts is not None else 0
+            chall_files = all_results.get(chall.id, [])
+            total_files += sum(1 for f in chall_files if (f.get("success") if isinstance(f, dict) else bool(f)))
+
+        # Build SUMMARY.md
+        lines = []
+        title = ctf_info.title or "CTF Challenges Summary"
+        lines.append(f"# 🏆 {title}\n")
+        
+        if ctf_info.url:
+            lines.append(f"- **URL**: {ctf_info.url}")
+        if ctf_info.user_name:
+            lines.append(f"- **User**: `{ctf_info.user_name}`")
+        if ctf_info.platform_type:
+            lines.append(f"- **Platform Engine**: `{ctf_info.platform_type.upper()}`")
+            
+        lines.append(f"- **Total Challenges**: {len(challenges)}")
+        lines.append(f"- **Total Categories**: {len(by_category)}")
+        lines.append(f"- **Total Points Available**: {_points_total_display(total_points)}")
+        lines.append(SUMMARY_FILES_LINE.format(total_files=total_files))
+
+        # Category Breakdown Table
+        lines.append("## 📊 Categories Overview\n")
+        lines.append("| Category | Challenges | Total Points |")
+        lines.append("| :--- | :--- | :--- |")
+        for cat, challs in sorted(by_category.items(), key=lambda kv: str(kv[0])):
+            cat_pts = sum(_points_value(c.points) or 0 for c in challs)
+            # md_cell: category do server kiểm soát — '|' sinh cột ảo,
+            # newline sinh hàng giả (hunter-c14 BUG-C14-3); cat_pts qua
+            # _points_total_display khử artefact float (review-5).
+            lines.append(f"| **{md_cell(cat)}** | {len(challs)} | {_points_total_display(cat_pts)} |")
+        lines.append("")
+
+        # Detailed Table per Category
+        for cat, challs in sorted(by_category.items(), key=lambda kv: str(kv[0])):
+            lines.append(f"## 📁 {md_cell(cat)}\n")
+            lines.append("| Challenge | Points | Solves | Files | Status | Path |")
+            lines.append("| :--- | :--- | :--- | :--- | :--- | :--- |")
+            for c in challs:
+                # Review-6 MED: đường dẫn trong SUMMARY phải đi qua CÙNG
+                # resolver với pipeline tải (C9-01 guard owner/-id) — tự
+                # tính sanitize() ở đây từng trỏ SUMMARY vào thư mục của
+                # CHỦ SỞ HỮU KHÁC khi resolver redirect sang name-<id>.
+                resolved = WorkspaceBuilder.resolve_challenge_dir(
+                    base_output_dir, c)
+                dir_rel = os.path.relpath(resolved, base_output_dir)
+                dir_rel = dir_rel.replace(os.sep, "/")   # link markdown
+                readme_rel = f"{dir_rel}/writeup/README.md"
+                
+                c_files = all_results.get(c.id, [])
+                succ_files = sum(1 for f in c_files if (f.get("success") if isinstance(f, dict) else bool(f)))
+                files_str = f"{succ_files} file(s)" if succ_files > 0 else "-"
+                
+                solves_str = str(c.solves_count) if c.solves_count is not None else "-"
+                # Spec status-model §6 (spec-audit GAP L): cột Status dùng bộ
+                # glyph chung tầng phosphor ROW_GLYPHS (status_service.py) thay
+                # emoji tự chọn ("✅ Solved"/"⏳ Unsolved"). Glyph là text thuần
+                # trong cell — không phá bảng markdown; bỏ phần style màu.
+                _G = ROW_GLYPHS["solve"]
+                status_str = (f"{_G['solved_by_me'][0]} Solved" if c.solved_by_me
+                              else f"{_G['unsolved'][0]} Unsolved")
+                
+                # Tên challenge cũng dữ liệu server — '|' vỡ bảng 6 cột;
+                # điểm None -> '-' (không in chữ 'None' ra cell).
+                lines.append(f"| **[{md_cell(c.name)}]({readme_rel})** | {_points_display(c.points)} | {solves_str} | {files_str} | {status_str} | [`{dir_rel}`]({dir_rel}) |")
+            lines.append("")
+
+        summary_content = "\n".join(lines)
+        summary_path = os.path.join(base_output_dir, "SUMMARY.md")
+
+        # XCHECK hunter-c9/c14: hai file tổng hợp này từng được ghi TRỰC TIẾP
+        # (open 'w' không atomic, không flock) trong khi rank-patcher/
+        # dashboard ghi cùng lúc qua WorkspaceRepo (atomic+flock) -> nội dung
+        # rách/ghi đè lost-update. SUMMARY.md giờ qua WorkspaceRepo
+        # write_summary_md: locked_write CÙNG khóa <name>.lock với
+        # patch_summary_live_rank + carry-forward badge Live Rank qua lần
+        # regenerate; GIỮ nguyên format output (json indent=2
+        # ensure_ascii=False, SUMMARY text).
+        repo = WorkspaceRepo(base_output_dir)
+        repo.write_summary_md(summary_content)
+
+        # Build challenges.json
+        json_data = {
+            "ctf_info": {
+                "title": ctf_info.title,
+                "url": ctf_info.url,
+                "platform": ctf_info.platform_type,
+                "user": ctf_info.user_name,
+                "team": ctf_info.team_name,
+                "game_id": ctf_info.game_id
+            },
+            "total_challenges": len(challenges),
+            "total_points": total_points,
+            "categories": {cat: len(challs) for cat, challs in by_category.items()},
+            "challenges": [
+                {
+                    "id": c.id,
+                    "name": c.name,
+                    "category": c.category,
+                    "points": c.points,
+                    "author": c.author,
+                    "tags": c.tags,
+                    "hints": c.hints,
+                    "connection_info": c.connection_info,
+                    "solved_by_me": c.solved_by_me,
+                    "solves_count": c.solves_count,
+                    "submit_endpoint": c.submit_endpoint,
+                    "instance_info": c.instance_info,
+                    "files": all_results.get(c.id, [])
+                }
+                for c in challenges
+            ]
+        }
+        json_path = os.path.join(base_output_dir, "challenges.json")
+        # locked_update_json: ghi đè toàn bộ dưới flock riêng challenges.json.lock
+        # (mutator bỏ qua state hiện tại — semantics overwrite như cũ), atomic
+        # tmp+replace trong phạm vi khóa. _json_safe áp TRƯỚC để giữ hành vi
+        # thay NaN/Inf -> None như bản ghi trực tiếp trước đây.
+        repo.mutate_challenges(
+            lambda _current: _json_safe(json_data)
+        )
+
+        return summary_path

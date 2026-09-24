@@ -1,0 +1,701 @@
+import re
+import time
+import urllib.parse
+import requests
+from typing import List, Dict, Any, Optional, Tuple
+from bs4 import BeautifulSoup
+from rich.markup import escape
+from .base import (BasePlatform, Challenge, CTFInfo, EventTimes, Verdict,
+                   PlatformRegisterUnsupported, SolveAttribution, epoch_ms,
+                   normalize_epoch_to_utc, safe_get_json)
+from ..utils.logger import Logger
+from .registry import register
+
+# Envelope JSON đặc trưng của rCTF: {"kind": "...", "message": ..., "data": ...}
+_RCTF_KIND_RE = re.compile(r"^(good|bad|unauth)")
+
+
+def rctf_register(platform, *, username: str, email: str, password: str,
+                  verify_email_hook=None) -> Dict[str, Any]:
+    """Register through current rCTF v2 auth API.
+
+    rCTF is token-based; ``password`` is intentionally unused. When captcha
+    protects the register action we fail closed/manual instead of bypassing it.
+    Email-verification completion uses the platform-aware tempmail hook.
+    """
+    base, sess = platform.base_url.rstrip("/"), platform.session
+
+    # Public runtime config is the canonical way to know whether registration
+    # is open and whether the register action is captcha-protected.
+    try:
+        cfg_resp = sess.get(
+            f"{base}/api/v2/integrations/client/config", timeout=15
+        )
+        cfg_json = cfg_resp.json() if cfg_resp.status_code == 200 else {}
+    except Exception as exc:
+        return {"ok": False,
+                "message": f"Không đọc được rCTF client config: {exc}"}
+
+    cfg_data = cfg_json.get("data") if isinstance(cfg_json, dict) else {}
+    cfg_data = cfg_data if isinstance(cfg_data, dict) else {}
+    if cfg_data.get("registrationsEnabled") is False:
+        return {"ok": False, "message": "rCTF đã tắt registration."}
+    captcha = cfg_data.get("captcha") or {}
+    protected = captcha.get("protectedEndpoints") if isinstance(captcha, dict) else {}
+    if isinstance(protected, dict) and protected.get("register"):
+        provider = captcha.get("provider") or "captcha"
+        raise PlatformRegisterUnsupported(
+            f"rCTF bật {provider} cho register — đăng ký thủ công. "
+            "Tool không bypass captcha."
+        )
+
+    payload = {"email": email, "name": username}
+    try:
+        resp = sess.post(f"{base}/api/v2/auth/register", json=payload,
+                         timeout=20)
+    except Exception as exc:
+        return {"ok": False, "message": f"Lỗi mạng khi register rCTF: {exc}"}
+
+    try:
+        data = resp.json() or {}
+    except Exception:
+        data = {}
+    kind = str(data.get("kind") or "")
+    message = str(data.get("message") or kind or f"HTTP {resp.status_code}")
+
+    if kind == "badCaptcha":
+        raise PlatformRegisterUnsupported(
+            "rCTF yêu cầu captcha cho register — đăng ký thủ công."
+        )
+    if resp.status_code == 429 or kind == "badRateLimit":
+        wait = ((data.get("data") or {}).get("timeLeft")
+                if isinstance(data.get("data"), dict) else None)
+        suffix = f" (timeLeft={wait})" if wait is not None else ""
+        return {"ok": False, "message": f"rCTF rate-limit: {message}{suffix}"}
+    if kind == "goodRegisterV2" and resp.status_code == 200:
+        tokens = data.get("data") or {}
+        return {
+            "ok": True,
+            "message": message,
+            "token": tokens.get("authToken"),
+            "team_token": tokens.get("teamToken"),
+            "email_verified": True,
+        }
+    if kind == "goodVerifySent" and resp.status_code == 200:
+        result: Dict[str, Any] = {
+            "ok": True,
+            "message": message,
+            "pending_email_verification": True,
+            "email_verified": False,
+        }
+        if verify_email_hook is None:
+            return result
+        verified = verify_email_hook(
+            sess, platform="rctf", base_url=base
+        )
+        ok = bool(verified.get("ok") if isinstance(verified, dict) else verified)
+        result["email_verified"] = ok
+        result["pending_email_verification"] = not ok
+        if isinstance(verified, dict):
+            vbody = verified.get("response") or {}
+            if isinstance(vbody, dict) and vbody.get("kind") == "goodRegisterV2":
+                tokens = vbody.get("data") or {}
+                result["token"] = tokens.get("authToken")
+                result["team_token"] = tokens.get("teamToken")
+        return result
+
+    return {"ok": False,
+            "message": f"rCTF register thất bại ({resp.status_code}/{kind}): {message}"}
+
+
+def probe_rctf_challs(origin: str, session, info, done: set) -> bool:
+    """/api/v1/challs -> envelope {kind, message, data}; badEndpoint cũng là dấu hiệu rCTF."""
+    if "rctf_challs" in done:
+        return False
+    done.add("rctf_challs")
+    data, status = safe_get_json(session, f"{origin}/api/v1/challs",
+                                 statuses=(200, 401, 403))
+    kind = data.get("kind") if isinstance(data, dict) else None
+    if isinstance(kind, str) and _RCTF_KIND_RE.match(kind):
+        info.capabilities["scoreboard"] = True
+        info.add_signal(f"GET /api/v1/challs -> envelope rCTF kind={kind}")
+        return True
+    info.add_signal(f"GET /api/v1/challs -> không khớp rCTF (HTTP {status})")
+    return False
+
+
+@register("rctf", label="rCTF", throttle=5.0,
+          html_markers=('name="rctf-config"', r'regex:"kind"\s*:\s*"'),
+          cookie_hints=(),
+          probes=(probe_rctf_challs,),
+          supports_scoreboard=True)
+class RCTFPlatform(BasePlatform):
+    # TTL cache solve-attribution (giây) — cùng pattern CTFd/GZCTF: watch
+    # tạo platform 1 lần/process, không TTL thì by_team/by_other đóng băng.
+    SOLVE_ATTR_TTL: float = 300.0
+
+    # Verdict là Literal (models.Verdict) — mọi giá trị gán phải thuộc
+    # {correct, incorrect, unknown, ratelimited}, không còn str tự do.
+    _last_verdict: Verdict = "unknown"
+
+    @property
+    def last_verdict(self) -> Verdict:
+        """Verdict lần submit gần nhất (correct|incorrect|unknown|ratelimited)."""
+        return self._last_verdict
+
+    @last_verdict.setter
+    def last_verdict(self, value: Verdict) -> None:
+        self._last_verdict = value
+
+    def __init__(self, base_url: str, session: requests.Session):
+        super().__init__(base_url, session)
+        self.ctf_info.platform_type = "rctf"
+
+    def _extract_title(self) -> None:
+        try:
+            h_resp = self.session.get(self.base_url, timeout=5)
+            if h_resp.status_code == 200:
+                soup = BeautifulSoup(h_resp.text, "html.parser")
+                title_el = soup.find("title")
+                if title_el and title_el.text and "rCTF" not in title_el.text:
+                    self.ctf_info.title = title_el.text.strip()
+        except Exception:
+            pass
+
+        if not self.ctf_info.title or self.ctf_info.title == "CTF Competition":
+            domain = urllib.parse.urlparse(self.base_url).netloc
+            clean_dom = domain.replace("ctf.", "").replace("www.", "").replace(".org", "").replace(".mn", "").replace(".com", "").replace(".", "_")
+            self.ctf_info.title = f"{clean_dom.capitalize()}_CTF"
+
+    def authenticate(self) -> bool:
+        """
+        Validates authentication on rCTF via /api/v1/auth/login, /api/v1/users/me, or /api/v1/challs.
+        """
+        self._extract_title()
+
+        # 1. Try exchanging token if provided in session or URL
+        auth_header = self.session.headers.get("Authorization", "")
+        extracted_token = None
+
+        if auth_header.startswith("Bearer "):
+            extracted_token = auth_header.split("Bearer ")[1].strip()
+        elif auth_header:
+            extracted_token = auth_header.strip()
+
+        # If we have a token, attempt teamToken login first
+        if extracted_token:
+            try:
+                login_resp = self.session.post(
+                    f"{self.base_url}/api/v1/auth/login",
+                    json={"teamToken": extracted_token},
+                    timeout=10
+                )
+                if login_resp.status_code == 200:
+                    l_data = login_resp.json()
+                    if l_data.get("kind") == "goodLogin" and l_data.get("data", {}).get("authToken"):
+                        new_auth = l_data["data"]["authToken"]
+                        self.session.headers["Authorization"] = f"Bearer {new_auth}"
+            except Exception:
+                pass
+
+        # 2. Check /api/v1/users/me
+        try:
+            resp = self.session.get(f"{self.base_url}/api/v1/users/me", timeout=15)
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("kind") in ["goodUserData", "goodUserSelfData"] and data.get("data"):
+                    user_name = data["data"].get("name")
+                    self.ctf_info.user_name = user_name
+                    self.ctf_info.team_name = user_name
+                    Logger.success(f"Đã xác thực rCTF với Team: [info]{escape(str(user_name))}[/info]", markup=True)
+                    return True
+        except Exception:
+            pass
+
+        # 3. Check public challenge access
+        try:
+            resp = self.session.get(f"{self.base_url}/api/v1/challs", timeout=15)
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("kind") == "goodChallenges":
+                    Logger.info("Đã xác nhận truy cập public vào challenges rCTF.")
+                    return True
+        except Exception:
+            pass
+
+        Logger.error("Xác thực thất bại trên nền tảng rCTF.")
+        return False
+
+    def register(self, *, username: str, email: str, password: str,
+                 verify_email_hook=None) -> Dict[str, Any]:
+        """Auto-register rCTF through the current v2 auth API."""
+        return rctf_register(
+            self,
+            username=username,
+            email=email,
+            password=password,
+            verify_email_hook=verify_email_hook,
+        )
+
+    def fetch_challenges(self) -> List[Challenge]:
+        """
+        Fetches all challenges from rCTF.
+        """
+        try:
+            resp = self.session.get(f"{self.base_url}/api/v1/challs", timeout=20)
+            if resp.status_code != 200:
+                Logger.error(f"Không tải được challenges từ rCTF (HTTP {resp.status_code})")
+                return []
+
+            json_data = resp.json()
+            if json_data.get("kind") != "goodChallenges":
+                Logger.error(f"Lỗi API rCTF: {json_data.get('message')}")
+                return []
+
+            raw_challs = json_data.get("data", [])
+            Logger.info(f"Tìm thấy {len(raw_challs)} challenges trên rCTF.")
+
+            challenges = []
+            for item in raw_challs:
+                chall_id = item.get("id")
+                name = item.get("name", f"Challenge_{chall_id}")
+                category = (item.get("category") or "Misc").strip() or "Misc"
+                points = item.get("points", 0)
+                author = item.get("author")
+                description = item.get("description", "")
+                solves = item.get("solves", 0)
+
+                # Parse files: [{"name": "file.zip", "url": "/uploads/..."}]
+                files_list = []
+                for f in item.get("files", []):
+                    f_name = f.get("name", "attachment")
+                    f_url = f.get("url", "")
+                    if f_url:
+                        files_list.append((self.get_full_file_url(f_url), f_name))
+
+                chall_obj = Challenge(
+                    id=chall_id,
+                    name=name,
+                    category=category,
+                    points=points,
+                    description=description,
+                    author=author,
+                    files=files_list,
+                    solves_count=solves,
+                    raw_data=item
+                )
+                challenges.append(chall_obj)
+
+            self.ctf_info.challenges = challenges
+            return challenges
+
+        except Exception as e:
+            Logger.error(f"Lỗi khi tải challenges rCTF: {str(e)}")
+            return []
+
+    def get_full_file_url(self, file_path: str) -> str:
+        if file_path.startswith("http://") or file_path.startswith("https://"):
+            return file_path
+        return urllib.parse.urljoin(self.base_url, file_path)
+
+    def fetch_rules(self) -> Optional[str]:
+        """
+        rCTF render rules client-side và không có endpoint public cho rules
+        -> không thể fetch, trả về None.
+        """
+        return None
+
+    def submit_flag(self, challenge_id: Any, flag: str) -> Tuple[bool, str]:
+        """
+        Submits a flag to rCTF platform (/api/v1/challs/{challenge_id}/submit).
+        Cập nhật self.last_verdict: correct | incorrect | unknown | ratelimited.
+        """
+        url = f"{self.base_url}/api/v1/challs/{challenge_id}/submit"
+        payload = {"flag": flag.strip()}
+
+        self.last_verdict = "unknown"
+
+        try:
+            resp = self.session.post(url, json=payload, timeout=15)
+            try:
+                data = resp.json()
+            except Exception:
+                data = {}
+
+            kind = data.get("kind", "")
+            message = data.get("message", "")
+
+            if kind == "goodFlag" or (resp.status_code == 200 and kind == "goodFlag"):
+                self.last_verdict = "correct"
+                return True, "🎉 Correct flag! Challenge solved!"
+            elif kind == "alreadySolved":
+                self.last_verdict = "already_solved"
+                return True, "✅ Bạn đã giải challenge này trước đó rồi!"
+            elif kind == "badFlag":
+                self.last_verdict = "incorrect"
+                return False, f"❌ Flag không đúng ({message or 'Bad Flag'})."
+            elif kind == "badRateLimit" or resp.status_code == 429:
+                self.last_verdict = "ratelimited"
+                return False, f"⏳ Rate limited! {message or 'Vui lòng chờ rồi submit lại.'}"
+            elif kind == "badChallenge":
+                self.last_verdict = "challenge_not_found"
+                return False, f"⚠️ Không tìm thấy challenge hoặc không khả dụng ({message})."
+            elif kind == "badToken":
+                self.last_verdict = "auth_failed"
+                return False, "🚫 Phiên xác thực hết hạn hoặc token không hợp lệ."
+            elif kind == "badStarted":
+                self.last_verdict = "event_not_started"
+                return False, f"⏳ Giải chưa bắt đầu ({message or 'event not started'})."
+            elif kind == "badEnded":
+                self.last_verdict = "event_closed"
+                return False, f"⏹️ Giải đã kết thúc ({message or 'event ended'})."
+            else:
+                # HTTP 200 chỉ tính ĐÚNG khi kind thuộc họ 'good*'; kind lạ/
+                # thiếu -> unknown (không đánh dấu solved oan — C10-03).
+                if resp.status_code == 200 and kind.startswith("good"):
+                    self.last_verdict = "correct"
+                    return True, f"🎉 Correct flag! {message or kind}"
+                self.last_verdict = "unknown"
+                return False, f"Máy chủ trả HTTP {resp.status_code}: {message or kind or resp.text[:100]}"
+
+        except Exception as e:
+            self.last_verdict = "unknown"
+            return False, f"Ngoại lệ khi submit flag: {str(e)}"
+
+    # ------------------------------------------------------------------
+    # Solve attribution (spec §4) — 1 account = 1 team: by_team ≡ by_me
+    # ------------------------------------------------------------------
+
+    def fetch_solve_attribution(self, challenge_ids) -> Dict[Any, SolveAttribution]:
+        """``users/me.solves[]`` có sẵn; ``challs/{id}/solves`` public bổ sung
+        solver_names / first-blood (0–1+N requests). Cache có TTL
+        (SOLVE_ATTR_TTL): hết hạn → fetch lại cho phiên watch dài."""
+        wanted = {str(c): c for c in (challenge_ids or [])}
+        now = time.monotonic()
+        ts = getattr(self, "_solve_attr_ts", None)
+        cache = getattr(self, "_solve_attr_cache", None)
+        if cache is None or ts is None or (now - ts) >= self.SOLVE_ATTR_TTL:
+            # R-L1: fetch vào dict local — chỉ SWAP cache + stamp ts SAU khi
+            # fetch thành công. Exception giữa chừng giữ nguyên data tốt của
+            # kỳ trước; ts cũ không bị đè nên lần tick sau retry ngay.
+            fresh: Dict[str, SolveAttribution] = {}
+            fetched_ok = False
+            try:
+                r_me = self.session.get(f"{self.base_url}/api/v1/users/me", timeout=15)
+                if r_me.status_code == 200:
+                    data = (r_me.json() or {}).get("data") or {}
+                    me_name = data.get("name")
+                    for s in data.get("solves") or []:
+                        cid = (s.get("chalId") if s.get("chalId") is not None
+                               else s.get("challengeId",
+                                            s.get("chaId", s.get("id"))))
+                        if cid is None:
+                            continue
+                        s_ts = epoch_ms(s.get("createdAt") or s.get("ts") or s.get("time"))
+                        names = [me_name] if me_name else []
+                        prev = fresh.get(str(cid))
+                        if prev is not None:
+                            # Giữ mốc SỚM NHẤT giữa các lần solve ghi nhận được
+                            if prev.solved_at is not None and s_ts is not None:
+                                s_ts = min(prev.solved_at, s_ts)
+                            elif s_ts is None:
+                                s_ts = prev.solved_at
+                        fresh[str(cid)] = SolveAttribution(
+                            by_me=True, by_team=True,
+                            solver_names=names, solved_at=s_ts)
+
+                    # Public solves: solver_names đầy đủ + first-blood
+                    for key, attr in list(fresh.items()):
+                        if wanted and key not in wanted:
+                            continue
+                        try:
+                            rc = self.session.get(
+                                f"{self.base_url}/api/v1/challs/{key}/solves", timeout=10)
+                            if rc.status_code != 200:
+                                continue
+                            rows = (rc.json() or {}).get("data") or []
+                        except Exception:
+                            continue
+                        names, all_ts = [], []
+                        for row in rows:
+                            nm = None
+                            if isinstance(row.get("user"), dict):
+                                nm = row["user"].get("name")
+                            nm = nm or row.get("userName") or row.get("name")
+                            if nm:
+                                names.append(nm)
+                            t = epoch_ms(row.get("ts") or row.get("time") or row.get("createdAt"))
+                            if t:
+                                all_ts.append(t)
+                        if names:
+                            attr.solver_names = names
+                        if all_ts:
+                            earliest = min(all_ts)
+                            attr.solved_at = attr.solved_at or earliest
+                            if attr.by_me and attr.solved_at == earliest:
+                                attr.first_blood = True
+                fetched_ok = True
+            except Exception:
+                pass
+            if fetched_ok:
+                cache = self._solve_attr_cache = fresh
+                self._solve_attr_ts = now
+            elif cache is None:
+                cache = {}   # chưa từng fetch thành công: trả rỗng, lần sau retry
+        return {orig: cache[k] for k, orig in wanted.items() if k in cache}
+
+    def fetch_scoreboard(self, if_none_match: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Fetches leaderboard standings from rCTF (/api/v1/leaderboard/now).
+        """
+        result = {
+            "title": self.ctf_info.title or "rCTF Leaderboard",
+            "my_team": self.ctf_info.team_name,
+            "my_user": self.ctf_info.user_name,
+            "my_rank": None,
+            "my_score": None,
+            "total_teams": 0,
+            "standings": [],
+            "_http_status": None,
+            "_etag": None,
+            "_retry_after": None,
+            "_not_modified": False,
+        }
+
+        url = f"{self.base_url}/api/v1/leaderboard/now"
+        limit, max_pages = 100, 10
+        try:
+            # rCTF schema bắt buộc query params limit & offset trên
+            # /api/v1/leaderboard/now — thiếu → lỗi validation → standings rỗng.
+            # limit=100 an toàn dưới maxLimit mặc định của rCTF.
+            all_entries: List[dict] = []
+            total: Optional[int] = None
+            offset = 0
+            # Phân trang: data.total > số dòng đã nhận → loop GET với
+            # offset += limit; chặn tối đa 10 trang để tránh loop vô hạn.
+            for _page in range(max_pages):
+                req_headers = (
+                    {"If-None-Match": if_none_match}
+                    if _page == 0 and if_none_match else {}
+                )
+                resp = self.session.get(
+                    url,
+                    params={"limit": limit, "offset": offset},
+                    timeout=15,
+                    headers=req_headers,
+                )
+                if _page == 0:
+                    result["_http_status"] = resp.status_code
+                    resp_headers = getattr(resp, "headers", None) or {}
+                    result["_etag"] = resp_headers.get("ETag") or if_none_match
+                    result["_retry_after"] = resp_headers.get("Retry-After")
+                    if resp.status_code == 304:
+                        result["_not_modified"] = True
+                        return result
+                if resp.status_code != 200:
+                    break
+                data = resp.json() or {}
+                data_field = data.get("data")
+                if isinstance(data_field, dict):
+                    page_rows = data_field.get("leaderboard", []) or []
+                    total = data_field.get("total")
+                else:
+                    page_rows = data_field if isinstance(data_field, list) else []
+                    total = None
+                if not page_rows:
+                    break
+                all_entries.extend(page_rows)
+                offset += limit
+                # Đủ total rồi, hoặc server trả trang ngắn hơn limit (hết dữ liệu)
+                if ((isinstance(total, int) and total <= len(all_entries))
+                        or len(page_rows) < limit):
+                    break
+
+            result["total_teams"] = len(all_entries)
+            standings = []
+            for idx, entry in enumerate(all_entries, 1):
+                name = entry.get("name")
+                score = entry.get("score")
+                pos = idx
+                if (result["my_team"] and name == result["my_team"]) or (result["my_user"] and name == result["my_user"]):
+                    result["my_rank"] = f"{pos}th"
+                    result["my_score"] = score
+
+                standings.append({
+                    "pos": pos,
+                    "name": name,
+                    "score": score,
+                    "raw": entry
+                })
+            result["standings"] = standings
+        except Exception as e:
+            result["_error"] = f"{type(e).__name__}: {e}"
+            Logger.warning(f"Không tải được leaderboard từ rCTF: {e}")
+
+        return result
+
+
+    # ------------------------------------------------------------------
+    # Event window (spec event-window §2): GET /api/v1/integrations/client/
+    # config → startTime/endTime EPOCH MS (có thể vắng mặt); fallback
+    # <meta name="rctf-config"> trong HTML trang chủ.
+    # ------------------------------------------------------------------
+    def fetch_event_times(self) -> Optional[EventTimes]:
+        start = end = None
+        confidence = "high"
+        source = "rctf:/api/v1/integrations/client/config"
+
+        # 1. Client config API
+        try:
+            resp = self.session.get(
+                f"{self.base_url}/api/v1/integrations/client/config", timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                payload = data.get("data") if isinstance(data, dict) else None
+                payload = payload if isinstance(payload, dict) else {}
+                start = normalize_epoch_to_utc(payload.get("startTime"))
+                end = normalize_epoch_to_utc(payload.get("endTime"))
+        except Exception:
+            pass
+
+        # 2. Fallback meta tag <meta name="rctf-config" content='{"startTime":...}'>
+        if start is None and end is None:
+            try:
+                resp = self.session.get(self.base_url, timeout=10)
+                if resp.status_code == 200:
+                    m = re.search(
+                        r'<meta\s+name="rctf-config"\s+content="([^"]*)"',
+                        resp.text, re.I)
+                    if m:
+                        import html as _html
+                        import json as _json
+                        cfg = _json.loads(_html.unescape(m.group(1)))
+                        start = normalize_epoch_to_utc(cfg.get("startTime"))
+                        end = normalize_epoch_to_utc(cfg.get("endTime"))
+                        if start is not None or end is not None:
+                            confidence = "medium"
+                            source = "rctf:meta[rctf-config]"
+            except Exception:
+                pass
+
+        if start is None and end is None:
+            return None
+        return EventTimes(start_utc=start, end_utc=end,
+                          confidence=confidence, source=source)
+
+    # ------------------------------------------------------------------
+    # Dynamic container instance support (rCTF v2 Instancer API)
+    # ------------------------------------------------------------------
+
+    def _instancer_url(self, challenge_id: Any) -> str:
+        import urllib.parse
+        encoded = urllib.parse.quote(str(challenge_id))
+        return f"{self.base_url}/api/v2/integrations/challs/{encoded}/instance"
+
+    def _normalize_rctf_instance_data(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        endpoints = data.get("endpoints") or []
+        entry = None
+        if endpoints and isinstance(endpoints, list):
+            ep = endpoints[0]
+            if isinstance(ep, dict):
+                host = ep.get("host")
+                port = ep.get("port")
+                if host and port:
+                    entry = f"{host}:{port}"
+        time_left_ms = data.get("timeLeftMilliseconds") or 0
+        time_left = round(time_left_ms / 1000) if time_left_ms else None
+        return {
+            "status": data.get("status", "unknown"),
+            "entry": entry,
+            "time_left": time_left,
+            "raw": data,
+        }
+
+    def _parse_instancer_200(self, resp: Any) -> Tuple[bool, Dict[str, Any]]:
+        """Parse a successful (HTTP 200) instancer API response.
+
+        Shared between PUT and POST paths to avoid duplication.
+        Returns (success, info_dict).
+        """
+        payload = self._json_object(resp) or {}
+        kind = str(payload.get("kind") or "")
+        if kind.startswith("bad") or kind == "error":
+            msg = payload.get("message") or f"Instancer error: {kind}"
+            return False, {"message": msg}
+        data = payload.get("data")
+        if not isinstance(data, dict) and not kind.startswith("good"):
+            return False, {"message": "Phản hồi start instance rCTF không hợp lệ."}
+        norm = self._normalize_rctf_instance_data(data or {})
+        if (norm.get("entry") is None and norm.get("time_left") is None
+                and norm.get("status") == "unknown"):
+            if not kind.startswith("good"):
+                return False, {"message": "Instancer không cung cấp thông tin container."}
+        return True, norm
+
+    def start_instance(self, challenge_id: Any) -> Tuple[bool, Dict[str, Any]]:
+        url = self._instancer_url(challenge_id)
+        try:
+            resp = self.session.put(url, json={}, timeout=self._timeout(15))
+            if resp.status_code == 200:
+                return self._parse_instancer_200(resp)
+            elif resp.status_code == 405:
+                # API drift (CTF-PLATFORM-D01): some rCTF deployments have
+                # migrated from PUT to POST for the instancer start action.
+                # Fall back to POST transparently; do NOT retry for any other
+                # non-success status to avoid unintended side effects.
+                try:
+                    resp2 = self.session.post(url, json={}, timeout=self._timeout(15))
+                except Exception as e:
+                    return False, {"message": str(e)}
+                if resp2.status_code == 200:
+                    return self._parse_instancer_200(resp2)
+                elif resp2.status_code == 400:
+                    payload = self._json_object(resp2) or {}
+                    data_obj = payload.get("data") if isinstance(payload, dict) else {}
+                    msg = ((data_obj.get("message") if isinstance(data_obj, dict) else None)
+                           or "Lỗi instancer")
+                    return False, {"message": msg}
+                return False, {"message": f"HTTP {resp2.status_code}: {resp2.text[:100]}"}
+            elif resp.status_code == 400:
+                payload = self._json_object(resp) or {}
+                data_obj = payload.get("data") if isinstance(payload, dict) else {}
+                msg = (data_obj.get("message") if isinstance(data_obj, dict) else None) or "Lỗi instancer"
+                return False, {"message": msg}
+            return False, {"message": f"HTTP {resp.status_code}: {resp.text[:100]}"}
+        except Exception as e:
+            return False, {"message": str(e)}
+
+    def stop_instance(self, challenge_id: Any) -> Tuple[bool, str]:
+        url = self._instancer_url(challenge_id)
+        try:
+            resp = self.session.delete(url, timeout=self._timeout(15))
+            if resp.status_code in (200, 204):
+                return True, "Đã dừng container."
+            return False, f"Dừng container thất bại (HTTP {resp.status_code})"
+        except Exception as e:
+            return False, str(e)
+
+    def extend_instance(self, challenge_id: Any) -> Tuple[bool, str]:
+        url = self._instancer_url(challenge_id)
+        try:
+            resp = self.session.patch(url, json={}, timeout=15)
+            if resp.status_code == 200:
+                return True, "Đã gia hạn thời gian sống của container."
+            return False, f"Gia hạn container thất bại (HTTP {resp.status_code})"
+        except Exception as e:
+            return False, str(e)
+
+    def get_instance_status(self, challenge_id: Any) -> Dict[str, Any]:
+        url = self._instancer_url(challenge_id)
+        try:
+            resp = self.session.get(url, timeout=10)
+            if resp.status_code == 200:
+                payload = self._json_object(resp) or {}
+                data = payload.get("data") or {}
+                norm = self._normalize_rctf_instance_data(data)
+                return norm
+            elif resp.status_code == 400:
+                return {"status": "unsupported", "entry": None, "time_left": None}
+            return {"status": "unknown", "entry": None, "time_left": None}
+        except Exception:
+            return {"status": "unknown", "entry": None, "time_left": None}

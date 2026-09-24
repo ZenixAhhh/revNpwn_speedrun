@@ -1,0 +1,341 @@
+"""
+SP3 — Recon & capability map (pipeline 4 tầng, registry-driven).
+
+Pipeline nhận diện nền tảng 4 tầng (rẻ -> đắt, dừng khi chắc chắn):
+  1. HTML markers  : GET base_url một lần, quét chuỗi/regex đặc trưng
+                     (nguồn: PlatformSpec.html_markers trong registry).
+  2. Cookies       : tên cookie đặc trưng (nguồn: PlatformSpec.cookie_hints).
+  3. Path probe    : hàm probe API (nguồn: PlatformSpec.probes), cũng dùng để
+                     làm giàu capabilities ngay cả khi tầng 1 đã nhận diện.
+  4. Fallback      : hành vi cũ (chuỗi URL, custom REST) -> cuối cùng là
+                     GenericHTMLPlatform thay vì CTFdPlatform (fix bug fallback).
+
+Chỉ THỨ TỰ ưu tiên giữa các tầng là chính sách của pipeline; toàn bộ dữ liệu
+nhận diện (markers / cookie_hints / probes / label) đọc từ platforms.registry.
+
+API chính:
+  - detect_platform_info(url, session, cookie_hint=None) -> (platform_instance, PlatformInfo)
+  - detect_platform(url, session) -> platform_instance (tương thích ngược 100%,
+    platform instance được gán sẵn thuộc tính `.info` = PlatformInfo).
+"""
+
+import re
+from typing import Optional, Tuple
+
+from .base import BasePlatform, safe_get, safe_get_json
+from .capabilities import PlatformInfo
+from .registry import PLATFORMS, get_spec
+from ..utils.logger import Logger
+from ..utils.urlnorm import parse_normalized
+
+# --------------------------------------------------------------------------- #
+# Chính sách thứ tự ưu tiên (giữ nguyên hành vi pipeline cũ) — dữ liệu từ registry
+# --------------------------------------------------------------------------- #
+_MARKER_PRIORITY = ("rctf", "ctfd", "gzctf", "asisctf", "tfcctf", "noctf")
+_COOKIE_PRIORITY = ("gzctf", "ctfd", "asisctf")
+_PROBE_PRIORITY = ("gzctf", "ctfd", "rctf", "asisctf", "tfcctf", "noctf")
+
+# Thông điệp signal tầng 1 theo platform key (giữ nguyên văn bản cũ để
+# tương thích với các test/log hiện có)
+_MARKER_SIGNALS = {
+    "rctf": "HTML marker: <meta name=\"rctf-config\"> hoặc envelope {kind,message,data}",
+    "ctfd": "HTML marker: csrfNonce' / window.init / Powered by CTFd / themes/core",
+    "gzctf": "HTML marker: <meta keywords> GZCTF hoặc chuỗi GZCTF/GZ::CTF",
+    "asisctf": "HTML marker: ASIS CTF / alpineInstance / challenges/list",
+    "tfcctf": "HTML marker: tfcctf / thefewchosen -> TFC CTF",
+    "noctf": "HTML marker: noCTF (<title>noCTF</title> / k17ctf) -> noCTF",
+}
+
+# Thông điệp signal tầng 2
+_COOKIE_SIGNALS = {
+    "gzctf": "Cookie GZCTF_Token trong cookie jar/hint -> nghi GZ::CTF",
+    "ctfd": "Cookie Flask 'session' vừa được set -> nghi CTFd",
+    "asisctf": "Cookie asis_ctf session -> nghi ASIS CTF",
+}
+
+
+
+def _parse_cookie_hint_names(cookie_hint: str) -> Optional[set]:
+    """Trích TÊN cookie từ chuỗi hint (kiểu chuỗi ``-c 'a=1; b=2'``).
+
+    Tách theo ``;`` và xuống dòng; mỗi cặp lấy phần trước ``=`` làm tên,
+    chuẩn hoá lowercase và bỏ quote bao quanh. Trả ``None`` khi KHÔNG parse
+    được cặp name=value nào -> caller fallback hành vi cũ (substring nguyên
+    blob). Task 6/7 deferred: khớp substring cả blob từng false-match khi
+    tên cookie xuất hiện giữa giá trị của cookie khác."""
+    from ..utils.sanitize import sanitize_cookie_input
+    cleaned = sanitize_cookie_input(cookie_hint) or ""
+    names: set = set()
+    for chunk in re.split(r"[;\r\n]+", cleaned):
+        chunk = chunk.strip()
+        if re.match(r"^[Cc][Oo][Oo][Kk][Ii][Ee]\s*:", chunk):
+            chunk = re.sub(r"^[Cc][Oo][Oo][Kk][Ii][Ee]\s*:\s*", "", chunk).strip()
+        if "=" not in chunk:
+            continue          # token trần không phải cặp name=value
+        name = chunk.split("=", 1)[0].strip().strip("'\"").strip()
+        if re.match(r"^[Cc][Oo][Oo][Kk][Ii][Ee]\s*:", name):
+            name = re.sub(r"^[Cc][Oo][Oo][Kk][Ii][Ee]\s*:\s*", "", name).strip()
+        if name:
+            names.add(name.lower())
+    return names or None
+
+
+def _response_schema(value, depth: int = 0):
+    """Describe JSON structure only; never retain response values for BQA."""
+    if depth >= 2:
+        return {"type": type(value).__name__}
+    if isinstance(value, dict):
+        keys = sorted(str(key) for key in value)[:30]
+        return {
+            "type": "object",
+            "keys": keys,
+            "properties": {str(key): _response_schema(value[key], depth + 1)
+                           for key in keys if key in value},
+        }
+    if isinstance(value, list):
+        return {"type": "array", "length": len(value),
+                "item": _response_schema(value[0], depth + 1) if value else None}
+    if value is None:
+        return {"type": "null"}
+    return {"type": type(value).__name__}
+
+
+def _match_html_markers(spec, html: str, low: str) -> bool:
+    """Khớp một marker của spec trên HTML. Marker tiền tố 'regex:' là mẫu regex."""
+    for marker in spec.html_markers:
+        if marker.startswith("regex:"):
+            pat = marker[len("regex:"):]
+            if len(pat) > 256:
+                continue
+            try:
+                # Search on bounded HTML sample (max 64KB) to prevent ReDoS
+                if re.search(pat, html[:65536]):
+                    return True
+            except (re.error, Exception):
+                continue
+        elif marker.lower() in low:
+            return True
+    return False
+
+
+def detect_platform_info(base_url: str, session,
+                         cookie_hint: Optional[str] = None,
+                         quiet: bool = False,
+                         workspace_path: Optional[str] = None) -> Tuple[BasePlatform, PlatformInfo]:
+    """
+    Dò tìm nền tảng CTF theo pipeline 4 tầng, trả về platform instance
+    (tương thích hoàn toàn với chữ ký/cách dùng cũ) kèm PlatformInfo.
+
+    ``quiet=True``: tắt toàn bộ log Logger của pipeline nhận diện (dòng
+    ``[*] Detected Platform`` 16-color và warning fallback) — dành cho các
+    surface tự render report riêng theo design system (vd ``ctf doctor``),
+    tránh lẫn rainbow/default-style vào output PHOSPHOR.
+    """
+    from .schema_store import PlatformSchemaStore
+    from .recon import PlatformReconEngine
+
+    # Đồng bộ các platform schema (builtin, global ~/.config, workspace .ctf) vào PLATFORMS registry
+    PlatformSchemaStore.sync_to_registry(workspace_path=workspace_path)
+
+    parsed, origin, clean_base_url = parse_normalized(base_url)
+    info = PlatformInfo(platform_type="unknown", base_url=clean_base_url)
+
+    game_match = re.search(r"/games?/(\d+)", parsed.path)
+    if game_match:
+        info.game_id = int(game_match.group(1))
+        info.add_signal(f"URL chứa /games/{info.game_id} -> game_id={info.game_id}")
+
+    done: set = set()
+    ptype, confidence = "unknown", "low"
+
+    # ---------------- Tầng 1: HTML markers (registry) ---------------- #
+    html = ""
+    recon_paths = ["/"]
+    recon_schema = None
+    resp = safe_get(session, clean_base_url)
+    root_status = getattr(resp, "status_code", None) if resp is not None else None
+    if resp is not None and root_status == 200:
+        html = getattr(resp, "text", "") or ""
+
+    if html:
+        low = html.lower()
+        marker_candidates = list(_MARKER_PRIORITY) + [
+            k for k in PLATFORMS if k not in _MARKER_PRIORITY and PLATFORMS[k].html_markers
+        ]
+        for key in marker_candidates:
+            if key not in PLATFORMS:
+                continue
+            if _match_html_markers(PLATFORMS[key], html, low):
+                ptype, confidence = key, "high"
+                info.add_signal(_MARKER_SIGNALS.get(key, f"HTML marker khớp {PLATFORMS[key].label}"))
+                break
+        else:
+            info.add_signal("HTML gốc không chứa marker nhận diện nào")
+
+    # ---------------- Tầng 2: Cookies (registry) ---------------- #
+    if confidence != "high":
+        # Hint dạng chuỗi được parse thành TÊN cookie (cặp name=value tách
+        # theo ';' / newline) — chỉ khớp khi TÊN trùng hint, không còn
+        # substring nguyên blob; không parse được cặp nào -> hành vi cũ.
+        hint_names = _parse_cookie_hint_names(cookie_hint) \
+            if cookie_hint else None
+
+        def _hint_matches(hint: str) -> bool:
+            if not cookie_hint:
+                return False
+            if hint_names is not None:
+                return hint.lower() in hint_names
+            return hint.lower() in cookie_hint.lower()
+
+        try:
+            cookie_names = set(session.cookies.keys())
+        except Exception:
+            cookie_names = set()
+
+        matched_cookie = False
+        cookie_candidates = list(_COOKIE_PRIORITY) + [
+            k for k in PLATFORMS if k not in _COOKIE_PRIORITY and PLATFORMS[k].cookie_hints
+        ]
+        for key in cookie_candidates:
+            if key not in PLATFORMS:
+                continue
+            for hint in PLATFORMS[key].cookie_hints:
+                if hint in cookie_names or _hint_matches(hint):
+                    ptype, confidence = key, "medium"
+                    info.add_signal(_COOKIE_SIGNALS.get(
+                        key, f"Cookie {hint} trong cookie jar/hint -> nghi {PLATFORMS[key].label}"))
+                    matched_cookie = True
+                    break
+            if matched_cookie:
+                break
+
+        if not matched_cookie and "_xsrf" in cookie_names:
+            # RootTheBox dùng cookie _xsrf nhưng chưa có adapter riêng
+            info.add_signal("Cookie _xsrf -> nghi RootTheBox (chưa có adapter)")
+
+    # ------------- Tầng 3: Path probe + envelope (registry) ------------- #
+    # Chạy đủ chuỗi probe (theo thứ tự rẻ -> chắc chắn): vừa xác nhận ứng
+    # viên ở tầng 2, vừa làm giàu capabilities khi tầng 1 đã nhận diện xong.
+    probe_candidates = list(_PROBE_PRIORITY) + [
+        k for k in PLATFORMS if k not in _PROBE_PRIORITY and PLATFORMS[k].probes
+    ]
+    for candidate in probe_candidates:
+        spec = PLATFORMS.get(candidate)
+        if spec is None:
+            continue
+        matched = False
+        for probe in spec.probes:
+            if probe(origin, session, info, done):
+                matched = True
+                break
+        if matched:
+            if confidence != "high":
+                ptype, confidence = candidate, "high"
+            break
+
+    # ------------- Tầng 4: Fallback hành vi cũ & Auto-Recon ------------- #
+    candidate_recon_schema = None
+    if confidence != "high":
+        # Hành vi cũ: Custom REST / Next.js (/api/challenges, /api/auth/me)
+        recon_paths.append("/api/challenges")
+        data, status = safe_get_json(session, f"{origin}/api/challenges",
+                                     statuses=(200, 401, 403))
+        if data is not None:
+            recon_schema = _response_schema(data)
+        payload = data.get("data") if isinstance(data, dict) else None
+        if isinstance(data, dict) and data.get("success") and isinstance(payload, dict) \
+                and "challenges" in payload:
+            ptype, confidence = "custom_rest", "high"
+            info.add_signal(f"GET /api/challenges -> shape Custom REST (HTTP {status})")
+        else:
+            recon_paths.append("/api/auth/me")
+            data, status = safe_get_json(session, f"{origin}/api/auth/me",
+                                         statuses=(200,))
+            if data is not None:
+                recon_schema = _response_schema(data)
+            user_data = data.get("data") if isinstance(data, dict) else None
+            if isinstance(data, dict) and data.get("success") \
+                    and isinstance(user_data, dict) and user_data.get("user"):
+                ptype, confidence = "custom_rest", "high"
+                info.add_signal(f"GET /api/auth/me -> có user (HTTP {status})")
+
+        if confidence != "high" and "/games" in parsed.path:
+            ptype, confidence = "gzctf", "medium"
+            info.add_signal("URL chứa /games -> GZ::CTF (nhận diện qua URL, hành vi cũ)")
+
+        # Tầng 4b: Tự động Auto-Recon khám phá platform chưa biết
+        if confidence != "high" and ptype == "unknown":
+            recon_result = PlatformReconEngine.probe_url(clean_base_url, session=session)
+            if recon_result.candidate_schema and recon_result.confidence in ("high", "medium"):
+                candidate_recon_schema = recon_result.candidate_schema
+                from .registry import PlatformSpec
+                dyn_cls = PlatformSchemaStore.make_adapter_class(candidate_recon_schema)
+                dyn_spec = PlatformSpec(
+                    key=candidate_recon_schema.key,
+                    label=candidate_recon_schema.label,
+                    cls=dyn_cls,
+                    throttle=candidate_recon_schema.throttle,
+                    html_markers=tuple(candidate_recon_schema.html_markers),
+                    cookie_hints=tuple(candidate_recon_schema.cookie_hints),
+                    supports_container=candidate_recon_schema.supports_container,
+                    supports_scoreboard=candidate_recon_schema.supports_scoreboard,
+                )
+                object.__setattr__(dyn_spec, "source", "custom_schema") if hasattr(dyn_spec, "__dict__") else None
+                PLATFORMS[candidate_recon_schema.key] = dyn_spec
+                dyn_cls.spec = dyn_spec
+                ptype = candidate_recon_schema.key
+                confidence = recon_result.confidence
+                info.add_signal(f"Auto-Recon: Khám phá API platform '{candidate_recon_schema.label}'")
+                for sig in recon_result.signals:
+                    info.add_signal(f"Auto-Recon: {sig}")
+
+    # ---------------- Kết luận + dựng platform ---------------- #
+    if ptype == "unknown":
+        info.add_signal("Fallback: mọi tầng nhận diện thất bại -> generic HTML scraper")
+        ptype = "generic_html"
+        info.capabilities["scoreboard"] = False  # scraper HTML không có scoreboard API
+        if not quiet:
+            Logger.warning("Không xác định được nền tảng. Fallback sang GenericHTMLPlatform.")
+
+    spec = get_spec(ptype)
+    platform = spec.cls(clean_base_url, session)
+    info.platform_type = getattr(platform.ctf_info, "platform_type", ptype)
+    platform_game_id = getattr(platform, "game_id", None)
+    if isinstance(platform_game_id, int):
+        info.game_id = platform_game_id
+    info.confidence = confidence
+    if candidate_recon_schema:
+        info.candidate_schema = candidate_recon_schema
+        platform.candidate_schema = candidate_recon_schema
+
+    # setattr mềm: các class platform không cần khai báo sẵn thuộc tính info
+    platform.info = info
+    platform.bqa_recon_evidence = {
+        "detector_signals": list(info.signals),
+        "http_status": root_status if isinstance(root_status, int) else None,
+        "api_paths": recon_paths,
+        "response_schema": recon_schema or {"type": "unavailable"},
+    }
+
+    if not quiet:
+        # AMBER REFIT (synthesis uiv2 #3): màu semantic chỉ qua token theme
+        # kèm glyph vai trò (✔ solved / ! warn) — bold green/yellow legacy
+        # phụ thuộc theme terminal người dùng đã bị bỏ.
+        conf_style, conf_glyph = (
+            ("solved", "✔") if confidence == "high" else ("warn", "!"))
+        Logger.info(
+            f"Nhận diện platform: [solved]✔ {spec.label}[/solved] "
+            f"(độ tin cậy: [{conf_style}]{conf_glyph} {confidence}[/{conf_style}])",
+            markup=True
+        )
+    return platform, info
+
+
+def detect_platform(base_url: str, session) -> BasePlatform:
+    """
+    Auto-detects the CTF platform (CTFd, rCTF, GZCTF, Custom REST, Generic).
+    Wrapper tương thích quanh detect_platform_info(): instance trả về luôn
+    mang thuộc tính `.info` (PlatformInfo) để caller mới tận dụng recon.
+    """
+    platform, _info = detect_platform_info(base_url, session)
+    return platform
